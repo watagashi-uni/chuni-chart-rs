@@ -88,7 +88,7 @@ fn run() -> Result<()> {
             let ws:Vec<_>=windows.iter().map(|w|serde_json::json!({"note":w.note,"lanes":(w.note.lane as usize..(w.note.lane+w.note.width)as usize).map(|l|chuni_chart_rs::judgement::bands(w,l,easy)).collect::<Vec<_>>()})).collect();
             serde_json::to_writer(
                 std::io::stdout(),
-                &serde_json::json!({"chart":c,"windows":ws}),
+                &serde_json::json!({"judgement_supported":chuni_chart_rs::judgement::supported(&c.notes),"chart":c,"windows":ws}),
             )
             .map_err(|_| "Cannot write inspection".into())
         }

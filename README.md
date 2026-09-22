@@ -50,9 +50,9 @@ GET /healthz
 ./target/release/chuni-chart-rs inspect charts/1086_03.c2s > timing.json
 ```
 
-时间使用小数 BPM 分段积分，保持线性时间轴。分列沿用原项目的小节长度统计与合并规则，列底部对齐，并保留接缝重叠区。SFL / SV2 绘制为标记，不改变时间轴。字体栅格化、亚像素坐标和整图缩放可能与浏览器存在少量像素差异。
+时间使用小数 BPM 分段积分，保持线性时间轴。分列沿用原项目的小节长度统计与合并规则，列底部对齐，并保留接缝重叠区。SFL / SV2 绘制为标记，不改变时间轴。超界 note 和长条按原坐标计算，只绘制 16 轨以内的部分，完全在轨道外的图形不显示，列宽保持不变。字体栅格化、亚像素坐标和整图缩放可能与浏览器存在少量像素差异。
 
-判定图提供普通 TAP、HOLD / SLIDE 头和 critical note 的范围及相邻 note 保护边界；FLICK 单独显示触摸入口。AIR、持续判定和实际操作状态不作为 JC / JUSTICE / ATTACK 矩形计算。
+判定图提供普通 TAP、HOLD / SLIDE 头和 critical note 的范围及相邻 note 保护边界；FLICK 单独显示触摸入口。AIR、持续判定和实际操作状态不作为 JC / JUSTICE / ATTACK 矩形计算。包含超界地面 note 的谱面目前仅支持普通图；`inspect` 会返回 `judgement_supported: false`。
 
 ## Linux 部署
 

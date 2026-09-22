@@ -92,12 +92,14 @@ fn tick(p: &[&str], resolution: f64) -> Result<f64> {
     }
     Ok(t)
 }
+// Some charts deliberately position art outside the 16 physical lanes.
+// Retain bounded coordinates for interpolation; the renderer clips the result.
 fn geometry(lane: f64, width: f64) -> Result<()> {
     if !lane.is_finite()
         || !width.is_finite()
-        || lane < 0.0
+        || lane < -128.0
         || width <= 0.0
-        || lane + width > 16.000001
+        || lane + width > 144.000001
     {
         return Err("Invalid note geometry".into());
     }

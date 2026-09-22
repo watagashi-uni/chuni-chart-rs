@@ -26,7 +26,7 @@ fn malformed_and_expanding_inputs() {
     for source in [
         "BPM_DEF NaN\nTAP 0 0 0 1",
         "BPM_DEF 0\nTAP 0 0 0 1",
-        "BPM_DEF 120\nTAP 0 0 16 1",
+        "BPM_DEF 120\nTAP 0 0 144 1",
         "BPM_DEF 120\nTAP 0 0 0.5 1",
         "BPM_DEF 120\nHLD 0 0 0 1 -1",
         "BPM_DEF 120\nALD 0 0 0 1 0.00000001 0 384 0 1 0 DEF",
@@ -181,4 +181,55 @@ fn original_measure_layout_and_scroll_annotations() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn off_lane_art_is_clipped_without_changing_layout_or_timing() {
+    // Synthetic overflowing heads, a gradient slide crossing the track, AIR and SV2.
+    let overflowing = "BPM_DEF 120\nTAP 0 96 -2 4\nMNE 0 144 -16 4\nAUL 0 192 15 4\nSLD 0 0 -16 4 384 28 4\nALD 0 0 -16 2 0 5 384 30 2 5 RED\nSLP 0 0 384 2 1\nSLA 0 0 -16 48 384 1\n";
+    let chart = Chart::parse(overflowing).unwrap();
+    let baseline = Chart::parse(
+        &overflowing
+            .replace("-2 4", "0 2")
+            .replace("-16 4", "0 4")
+            .replace("15 4", "12 4")
+            .replace("28 4", "12 4")
+            .replace("-16 2", "0 2")
+            .replace("30 2", "14 2")
+            .replace("-16 48", "0 16"),
+    )
+    .unwrap();
+    assert_eq!(chart.duration, baseline.duration);
+    assert_eq!(chart.notes[0].time, baseline.notes[0].time);
+    assert!(chart.notes.iter().any(|n| n.lane < 0.0));
+    let o = Options::default();
+    let decode = |c: &Chart| {
+        let bytes = render::render(c, &o).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        (info.width, info.height, pixels)
+    };
+    let (w, h, pixels) = decode(&chart);
+    let (bw, bh, reference) = decode(&baseline);
+    assert_eq!((w, h), (bw, bh));
+    assert_eq!(render::dimensions(&chart, &o).unwrap().columns, 1);
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            // Only track pixels may change. Gutter text and neighbouring space stay intact.
+            if !(68..228).contains(&x) {
+                let i = (y * w as usize + x) * 4;
+                assert_eq!(
+                    &pixels[i..i + 4],
+                    &reference[i..i + 4],
+                    "Gutter changed at {x},{y}"
+                );
+            }
+        }
+    }
+    assert!(!chuni_chart_rs::judgement::supported(&chart.notes));
+    assert!(protect(&chart.notes, false).is_empty());
+    assert!(render::render(&chart, &Options { judge: true, ..o }).is_err());
 }

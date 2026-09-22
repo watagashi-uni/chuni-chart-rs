@@ -21,7 +21,18 @@ fn overlap(a: &Note, b: &Note) -> bool {
 fn inside(l: usize, a: &Note, b: &Note) -> bool {
     (l as f64) >= a.lane.max(b.lane) && (l as f64) < (a.lane + a.width).min(b.lane + b.width)
 }
+pub fn supported(input: &[Note]) -> bool {
+    input
+        .iter()
+        .filter(|n| n.ground())
+        .all(|n| n.lane >= 0.0 && n.lane + n.width <= 16.0)
+}
+
+// Off-lane geometry has no verified judgement model; only the ordinary renderer supports it.
 pub fn protect(input: &[Note], easy: bool) -> Vec<Window> {
+    if !supported(input) {
+        return Vec::new();
+    }
     let jc = 2.0 / 60.0;
     let attack: f64 = if easy { 6.0 } else { 5.0 } / 60.0;
     let mut ns: Vec<_> = input

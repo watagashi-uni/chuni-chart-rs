@@ -15,6 +15,7 @@ binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else 'target/release/chuni-ch
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
     (root / 'demo.c2s').write_text((Path(__file__).resolve().parents[1] / 'tests/fixtures/demo.c2s').read_text())
+    (root / 'overflow.c2s').write_text('BPM_DEF 120\nTAP 0 96 -2 4\nSLD 0 0 -16 4 384 28 4')
     (root / 'bad.c2s').write_text('BPM_DEF NaN\nTAP 0 0 0 1')
     (root / 'large.c2s').write_bytes(b' ' * (2 * 1024 * 1024 + 1))
     (root / 'slow.c2s').write_text('BPM_DEF 120\n' + '\n'.join(f'TAP 0 {i*4} 0 16' for i in range(11000)))
@@ -42,6 +43,9 @@ with tempfile.TemporaryDirectory() as directory:
         for mode in [0, 1]:
             status, body = request(f'/api/render?name=demo&judge={mode}&format=jpg')
             assert status == 200 and body[:2] == b'\xff\xd8', (status, body[:100])
+        status, body = request('/preview?name=overflow')
+        assert status == 200 and body[:8] == b'\x89PNG\r\n\x1a\n'
+        assert request('/judge?name=overflow')[0] == 422
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             jobs = [pool.submit(request, '/judge?name=slow') for _ in range(8)]
             time.sleep(.1)

@@ -56,6 +56,9 @@ fn sheet(c: &Chart, o: &Options) -> Result<(crate::layout::Layout, f64, f64)> {
     if !matches!(o.format.as_str(), "png" | "jpg" | "jpeg") {
         return Err("Unsupported output format".into());
     }
+    if o.judge && !crate::judgement::supported(&c.notes) {
+        return Err("Off-lane charts currently support ordinary previews only".into());
+    }
     let mut layout = crate::layout::layout(c, o.zoom);
     if let Some(column) = o.column {
         if column == 0 || column > layout.ranges.len() {
@@ -93,9 +96,17 @@ struct Canvas {
     scale: f32,
     font: fontdue::Font,
     blend: tiny_skia::BlendMode,
+    clip_x: Option<(f64, f64)>,
 }
 impl Canvas {
     fn path(&mut self, points: &[(f64, f64)], color: Color, stroke: Option<f32>, closed: bool) {
+        let clipped;
+        let points = if closed && let Some((left, right)) = self.clip_x {
+            clipped = clip_x(points.to_vec(), left, right);
+            clipped.as_slice()
+        } else {
+            points
+        };
         if points.len() < 2 {
             return;
         }
@@ -197,6 +208,13 @@ fn clip_y(mut p: Vec<(f64, f64)>, lo: f64, hi: f64) -> Vec<(f64, f64)> {
     }
     p
 }
+// Clip vertices before rasterization: no per-note canvas or mask allocation.
+fn clip_x(p: Vec<(f64, f64)>, left: f64, right: f64) -> Vec<(f64, f64)> {
+    clip_y(p.into_iter().map(|(x, y)| (y, x)).collect(), left, right)
+        .into_iter()
+        .map(|(y, x)| (x, y))
+        .collect()
+}
 struct Bounded(Vec<u8>);
 impl Write for Bounded {
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -247,6 +265,13 @@ impl Canvas {
         unit_end: f64,
     ) {
         use tiny_skia::{GradientStop, LinearGradient, Point, SpreadMode};
+        let clipped;
+        let points = if let Some((left, right)) = self.clip_x {
+            clipped = clip_x(points.to_vec(), left, right);
+            clipped.as_slice()
+        } else {
+            points
+        };
         if points.len() < 3 || yb <= yt {
             return;
         }
@@ -654,6 +679,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
         )
         .map_err(|_| "Font load failed")?,
         blend: tiny_skia::BlendMode::SourceOver,
+        clip_x: None,
     };
     v.pix.fill(tiny_skia::Color::from_rgba8(107, 114, 128, 255));
     if o.judge {
@@ -682,6 +708,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
     let units = slide_units(c);
     let divs = divisions(c);
     for (col, &(start, end)) in layout.ranges.iter().enumerate() {
+        v.clip_x = None;
         let x = 68.0 + col as f64 * STRIDE;
         let top = bottom - (end - start) * pps;
         let y = |t: f64| bottom - (t - start) * pps;
@@ -740,12 +767,15 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
                     );
                 } else {
                     color[3] = 26;
+                    v.clip_x = Some((x, x + 160.0));
                     v.blend = tiny_skia::BlendMode::Screen;
                     v.rect(x + sv.lane * 10.0, yt, sv.width * 10.0, yb - yt, color);
                     v.blend = tiny_skia::BlendMode::SourceOver;
+                    v.clip_x = None;
                 }
             }
         }
+        v.clip_x = Some((x, x + 160.0));
         for layer in 2..=5 {
             for (i, n) in c.longs.iter().enumerate() {
                 let hold = matches!(n.head.kind.as_str(), "HLD" | "HXD");
@@ -851,6 +881,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
             }
         }
     }
+    v.clip_x = None;
     v.rect(0.0, h - FOOT, w, FOOT, rgba(32, 43, 60, 255));
     v.text(
         12.0,
