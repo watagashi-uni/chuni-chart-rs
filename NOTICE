@@ -1,0 +1,35 @@
+chuni-chart-rs
+Copyright (C) 2026 わたがし and contributors
+License: GNU Affero General Public License, version 3 (AGPL-3.0-only).
+
+Original open-source project: QingQiz/MarisaBot / Marisa.Frontend
+https://github.com/QingQiz/MarisaBot
+Copyright remains with QingQiz and the original contributors.
+Original license: GNU Affero General Public License version 3.
+C2S field conventions and note grouping follow that project's
+src/components/chunithm/utils/parser.ts and BeatmapVisualizer components.
+
+This modified implementation provides a Rust C2S parser, numerical judgement
+calculation, direct CPU raster rendering, and a bounded HTTP worker service.
+It is based on the standalone parser/calculation port in:
+https://github.com/watagashi-uni/chuni-judgement
+Original contributors' rights are retained.
+
+Judgement behaviour reference:
+https://github.com/pingfanH/umiguri-re
+Commit 3aa8ebc53030cd178d5d90201e4ae2036f61c0bd
+The independently named numerical implementation follows the static
+eligibility rules in cw() and normal timing constants in judgeWindows.
+No game bundle, art, sound or upstream source file is redistributed here.
+This project does not relicense those external works.
+
+Direct raster service architecture reference:
+https://github.com/watagashi-uni/pjsekai-scores-rs
+No code or assets from that MIT project are copied here.
+
+The embedded DejaVu Sans font retains its separate license; see
+assets/FONT-LICENSE. Synthetic example charts and regression inputs were
+created for this project and contain no music data.
+
+Modified source: https://github.com/watagashi-uni/chuni-chart-rs
+See LICENSE for the complete license terms.

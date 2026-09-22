@@ -1,0 +1,33 @@
+[Unit]
+Description=Chuni Chart native renderer
+After=network.target
+
+[Service]
+Type=simple
+User=chuni-chart
+Group=chuni-chart
+Environment=CHART_DIR=/srv/chuni-chart/charts
+Environment=LISTEN=127.0.0.1:3000
+ExecStart=/opt/chuni-chart/bin/chuni-chart-rs serve
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillMode=control-group
+MemoryHigh=256M
+MemoryMax=384M
+MemorySwapMax=0
+TasksMax=32
+CPUQuota=200%
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

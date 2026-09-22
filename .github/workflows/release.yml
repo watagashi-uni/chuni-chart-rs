@@ -1,0 +1,27 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Package and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist/package
+          cp target/x86_64-unknown-linux-musl/release/chuni-chart-rs LICENSE NOTICE README.md dist/package/
+          cp assets/FONT-LICENSE dist/package/
+          cp -r deploy dist/package/
+          tar -czf dist/chuni-chart-rs-linux-x64.tar.gz -C dist/package .
+          cd dist
+          sha256sum chuni-chart-rs-linux-x64.tar.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" chuni-chart-rs-linux-x64.tar.gz SHA256SUMS --title "$GITHUB_REF_NAME" --notes 'Linux x86_64 static binary. See README for file-directory and systemd deployment.'
