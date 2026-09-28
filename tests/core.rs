@@ -86,6 +86,119 @@ fn critical_has_only_jc() {
     assert!((bs[0].from + 5.0 / 60.0).abs() < 1e-12);
 }
 #[test]
+fn critical_coverage_promotes_full_heads_with_overhangs_and_protection() {
+    for record in ["HLD 0 192 4 4 96", "SLC 0 192 4 4 96 8 4"] {
+        for cover in [
+            "CHR 0 192 0 8",
+            "CHR 0 192 4 8",
+            "CHR 0 192 0 16",
+            "CHR 0 192 6 6\nCHR 0 192 0 6",
+        ] {
+            let c =
+                Chart::parse(&format!("BPM_DEF 120\n{record}\n{cover}\nTAP 0 201.6 6 4")).unwrap();
+            let head = c
+                .notes
+                .iter()
+                .find(|n| matches!(n.kind.as_str(), "HLD_H" | "SLD_H"))
+                .unwrap();
+            assert!(head.critical());
+            for easy in [false, true] {
+                let mut notes = c.notes.clone();
+                // The direct numerical API must also recognize unannotated heads.
+                for n in &mut notes {
+                    n.critical = false;
+                }
+                let ws = protect(&notes, easy);
+                let w = ws.iter().find(|w| w.note.kind == head.kind).unwrap();
+                for lane in 4..8 {
+                    let bs = bands(w, lane, easy);
+                    assert_eq!(bs.len(), 1);
+                    assert_eq!(bs[0].grade, "JC");
+                }
+                let attack = if easy { 0.1 } else { 5.0 / 60.0 };
+                assert!((bands(w, 4, easy)[0].to - attack).abs() < 1e-12);
+                assert!((bands(w, 7, easy)[0].to - 0.025).abs() < 1e-12);
+            }
+        }
+    }
+}
+#[test]
+fn partial_gapped_or_different_time_critical_does_not_promote_heads_or_tails() {
+    for cover in [
+        "CHR 0 192 0 6",
+        "CHR 0 192 0 5\nCHR 0 192 6 6",
+        "CHR 0 193 0 16",
+    ] {
+        let c = Chart::parse(&format!("BPM_DEF 120\nHLD 0 192 4 4 96\n{cover}")).unwrap();
+        assert!(
+            !c.notes
+                .iter()
+                .find(|n| n.kind == "HLD_H")
+                .unwrap()
+                .critical()
+        );
+    }
+    let c = Chart::parse("BPM_DEF 120\nHLD 0 96 4 4 96\nTAP 0 192 4 4\nCHR 0 192 0 16").unwrap();
+    assert!(
+        c.notes
+            .iter()
+            .filter(|n| n.kind == "HLD_T" || n.kind == "TAP")
+            .all(|n| !n.critical())
+    );
+}
+
+fn decode_png(c: &Chart, o: &Options) -> (u32, u32, Vec<u8>) {
+    let bytes = render::render(c, o).unwrap();
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+        .read_info()
+        .unwrap();
+    let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut pixels).unwrap();
+    (info.width, info.height, pixels)
+}
+
+#[test]
+fn thin_attack_is_bright_green_in_final_pixels_without_white_contours() {
+    for (zoom, end_measure) in [(0.5, 2), (1.0, 2), (2.0, 2), (1.0, 299)] {
+        for height in [1.0, 2.0] {
+            let mut c = Chart::parse(&format!(
+                "BPM_DEF 120\nTAP 0 192 0 4\nTAP 0 220 0 4\nTAP {end_measure} 0 12 1"
+            ))
+            .unwrap();
+            let o = Options {
+                judge: true,
+                zoom,
+                ..Default::default()
+            };
+            let d = render::dimensions(&c, &o).unwrap();
+            c.notes[1].time = 1.0 + 2.0 * (4.0 / 60.0 + height / d.pixels_per_second);
+            let layout = chuni_chart_rs::layout::layout(&c, zoom);
+            let scale = d.pixels_per_second / layout.pps;
+            if end_measure == 299 {
+                assert!(scale < 1.0, "Exercise automatic image downscaling");
+            }
+            let bottom = layout
+                .ranges
+                .iter()
+                .map(|(a, b)| (b - a) * layout.pps)
+                .fold(0.0, f64::max)
+                + 82.0;
+            let boundary_time = (c.notes[0].time + c.notes[1].time) / 2.0;
+            let boundary_y = (bottom - (boundary_time - layout.ranges[0].0) * layout.pps) * scale;
+            let (w, _, pixels) = decode_png(&c, &o);
+            let row = boundary_y.round() as usize;
+            // Include both outer sides: white outlines must not cover the green strip.
+            for x in (68.0 * scale).ceil() as usize..(108.0 * scale).floor() as usize {
+                let p = &pixels[(row * w as usize + x) * 4..][..4];
+                assert!(
+                    p[1] > 200 && p[0] < 100 && p[2] < 180,
+                    "zoom={zoom}, height={height}, pixel ({x},{row})={p:?}"
+                );
+            }
+        }
+    }
+}
+#[test]
 fn direct_images_and_pixel_budget() {
     let c = Chart::parse(SIMPLE).unwrap();
     for format in ["png", "jpg"] {

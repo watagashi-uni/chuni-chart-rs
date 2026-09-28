@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use crate::{
     MAX_OUTPUT_BYTES, Result,
-    chart::Chart,
+    chart::{Chart, mark_critical_heads},
     judgement::{bands, protect},
 };
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,59 @@ struct Canvas {
     clip_x: Option<(f64, f64)>,
 }
 impl Canvas {
+    // Omit strokes inside narrow ATTACK rectangles without allocating image masks.
+    fn outline_segment(&mut self, a: (f64, f64), b: (f64, f64), gaps: &[[f64; 4]]) {
+        let delta = [b.0 - a.0, b.1 - a.1];
+        if delta == [0.0, 0.0] {
+            return;
+        }
+        let origin = [a.0, a.1];
+        let mut spans = vec![(0.0_f64, 1.0_f64)];
+        for gap in gaps {
+            let (mut enter, mut exit) = (0.0_f64, 1.0_f64);
+            for axis in 0..2 {
+                // Half of the 1.1px contour width, before output scaling.
+                let (lo, hi) = (gap[axis] - 0.55, gap[axis + 2] + 0.55);
+                if delta[axis] == 0.0 {
+                    if origin[axis] < lo || origin[axis] > hi {
+                        enter = 1.0;
+                        exit = 0.0;
+                        break;
+                    }
+                } else {
+                    let t0 = (lo - origin[axis]) / delta[axis];
+                    let t1 = (hi - origin[axis]) / delta[axis];
+                    enter = enter.max(t0.min(t1));
+                    exit = exit.min(t0.max(t1));
+                }
+            }
+            if exit <= enter {
+                continue;
+            }
+            spans = spans
+                .into_iter()
+                .flat_map(|(lo, hi)| {
+                    if exit <= lo || enter >= hi {
+                        vec![(lo, hi)]
+                    } else {
+                        vec![(lo, hi.min(enter)), (lo.max(exit), hi)]
+                    }
+                })
+                .filter(|(lo, hi)| hi - lo > 1e-9)
+                .collect();
+        }
+        for (lo, hi) in spans {
+            self.path(
+                &[
+                    (a.0 + delta[0] * lo, a.1 + delta[1] * lo),
+                    (a.0 + delta[0] * hi, a.1 + delta[1] * hi),
+                ],
+                rgba(231, 243, 255, 205),
+                Some(1.1),
+                false,
+            );
+        }
+    }
     fn path(&mut self, points: &[(f64, f64)], color: Color, stroke: Option<f32>, closed: bool) {
         let clipped;
         let points = if closed && let Some((left, right)) = self.clip_x {
@@ -568,6 +621,7 @@ fn glyph(v: &mut Canvas, n: &crate::chart::Note, x: f64, yy: f64, top: f64, bott
     let xx = x + n.lane * 10.0 + 1.0;
     let ww = n.width * 10.0 - 1.0;
     let color = match n.kind.as_str() {
+        _ if n.critical() => rgba(250, 204, 21, 255),
         "CHR" => rgba(250, 204, 21, 255),
         "TAP" => rgba(248, 113, 113, 255),
         "HLD_H" | "HLD_T" => rgba(251, 146, 60, 255),
@@ -630,7 +684,9 @@ fn glyph(v: &mut Canvas, n: &crate::chart::Note, x: f64, yy: f64, top: f64, bott
                 ww - 6.0,
                 1.0,
                 0.5,
-                if n.kind == "HLD_H" {
+                if n.critical() {
+                    rgba(254, 240, 138, 255)
+                } else if n.kind == "HLD_H" {
                     rgba(246, 195, 147, 255)
                 } else {
                     rgba(98, 137, 244, 255)
@@ -670,6 +726,8 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
     let scale = d.pixels_per_second / layout.pps;
     let pps = layout.pps;
     let bottom = h - FOOT - 44.0;
+    let mut notes = c.notes.clone();
+    mark_critical_heads(&mut notes);
     let mut v = Canvas {
         pix: Pixmap::new(d.width, d.height).ok_or("Image allocation failed")?,
         scale: scale as f32,
@@ -701,7 +759,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
         }
     }
     let windows = if o.judge {
-        protect(&c.notes, o.easy)
+        protect(&notes, o.easy)
     } else {
         Vec::new()
     };
@@ -788,7 +846,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
                 }
             }
             if !o.judge {
-                for n in &c.notes {
+                for n in &notes {
                     if n.time >= start
                         && n.time < end
                         && ((layer == 3 && n.kind == "HLD_T")
@@ -808,6 +866,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
             let all: Vec<_> = (first..last).map(|l| bands(w, l, o.easy)).collect();
             // Merge equal adjacent lanes; a note's outer contour remains visible.
             let mut i = 0;
+            let mut thin_attacks = Vec::new();
             while i < all.len() {
                 let mut j = i + 1;
                 while j < all.len() && all[j] == all[i] {
@@ -816,12 +875,22 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
                 for b in &all[i] {
                     let yt = y(w.note.time + b.to).max(top);
                     let yb = y(w.note.time + b.from).min(bottom);
+                    let xl = x + (first + i) as f64 * 10.0;
+                    let width = (j - i) as f64 * 10.0;
+                    let thin = b.grade == "ATTACK" && yb > yt && (yb - yt) * scale <= 2.0 + 1e-9;
+                    if thin {
+                        thin_attacks.push([xl, yt, xl + width, yb]);
+                    }
                     v.rect(
-                        x + (first + i) as f64 * 10.0,
+                        xl,
                         yt,
-                        (j - i) as f64 * 10.0,
+                        width,
                         yb - yt,
-                        grade(b.grade),
+                        if thin {
+                            rgba(57, 255, 136, 255)
+                        } else {
+                            grade(b.grade)
+                        },
                     );
                 }
                 i = j;
@@ -837,7 +906,6 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
                     })
                 })
                 .collect();
-            let ink = rgba(231, 243, 255, 205);
             for (i, b) in bounds.iter().enumerate() {
                 if let Some((yt, yb)) = *b {
                     if yb <= yt {
@@ -845,23 +913,23 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
                     }
                     let xl = x + (first + i) as f64 * 10.0;
                     let xr = xl + 10.0;
-                    v.path(&[(xl, yt), (xr, yt)], ink, Some(1.1), false);
-                    v.path(&[(xl, yb), (xr, yb)], ink, Some(1.1), false);
+                    v.outline_segment((xl, yt), (xr, yt), &thin_attacks);
+                    v.outline_segment((xl, yb), (xr, yb), &thin_attacks);
                     let prev = i.checked_sub(1).and_then(|k| bounds[k]);
                     if let Some((pt, pb)) = prev {
-                        v.path(&[(xl, yt), (xl, pt)], ink, Some(1.1), false);
-                        v.path(&[(xl, yb), (xl, pb)], ink, Some(1.1), false);
+                        v.outline_segment((xl, yt), (xl, pt), &thin_attacks);
+                        v.outline_segment((xl, yb), (xl, pb), &thin_attacks);
                     } else {
-                        v.path(&[(xl, yt), (xl, yb)], ink, Some(1.1), false);
+                        v.outline_segment((xl, yt), (xl, yb), &thin_attacks);
                     }
                     if i + 1 == bounds.len() || bounds[i + 1].is_none() {
-                        v.path(&[(xr, yt), (xr, yb)], ink, Some(1.1), false);
+                        v.outline_segment((xr, yt), (xr, yb), &thin_attacks);
                     }
                 }
             }
         }
 
-        for n in &c.notes {
+        for n in &notes {
             if n.time >= start
                 && n.time < end
                 && !n.kind.starts_with('A')
@@ -875,7 +943,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
                 long_path(&mut v, n, x, &y, top, bottom, units[i]);
             }
         }
-        for n in &c.notes {
+        for n in &notes {
             if n.time >= start && n.time < end && n.kind.starts_with('A') {
                 glyph(&mut v, n, x, y(n.time), top, bottom);
             }

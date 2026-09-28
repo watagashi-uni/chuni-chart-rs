@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Independently named port of UMIGURI cw(); see NOTICE for reference revision.
-use crate::chart::Note;
+use crate::chart::{Note, mark_critical_heads};
 use serde::Serialize;
 #[derive(Clone, Debug)]
 pub struct Window {
@@ -35,6 +35,8 @@ pub fn protect(input: &[Note], easy: bool) -> Vec<Window> {
     }
     let jc = 2.0 / 60.0;
     let attack: f64 = if easy { 6.0 } else { 5.0 } / 60.0;
+    let mut input = input.to_vec();
+    mark_critical_heads(&mut input);
     let mut ns: Vec<_> = input
         .iter()
         .filter(|n| n.ground())

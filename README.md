@@ -54,6 +54,8 @@ GET /healthz
 
 判定图提供普通 TAP、HOLD / SLIDE 头和 critical note 的范围及相邻 note 保护边界；FLICK 单独显示触摸入口。AIR、持续判定和实际操作状态不作为 JC / JUSTICE / ATTACK 矩形计算。包含超界地面 note 的谱面目前仅支持普通图；`inspect` 会返回 `judgement_supported: false`。
 
+同一时刻的 Critical 完整覆盖 HOLD / SLIDE 头时，整个头按 Critical 计算和显示，只保留 JC；Critical 可以超出头部宽度，也可以由多个连续区间拼接覆盖。最终图片中高度不超过 2 像素的 ATTACK 区域使用不透明亮绿色，不绘制该区域的边框，判定范围不变。
+
 ## Linux 部署
 
 建议使用 systemd 管理二进制服务。仓库附带 [service 文件](deploy/chuni-chart.service)，默认仅监听本机，外部访问由部署者的反向代理转发。

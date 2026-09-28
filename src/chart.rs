@@ -11,6 +11,8 @@ pub struct Note {
     pub time: f64,
     pub lane: f64,
     pub width: f64,
+    #[serde(default)]
+    pub critical: bool,
 }
 impl Note {
     pub fn ground(&self) -> bool {
@@ -20,7 +22,39 @@ impl Note {
         )
     }
     pub fn critical(&self) -> bool {
-        self.kind == "CHR"
+        self.kind == "CHR" || (matches!(self.kind.as_str(), "HLD_H" | "SLD_H") && self.critical)
+    }
+}
+// Same-time CHR intervals may extend beyond either edge, or jointly cover a head.
+// Keep the long-note type so its body, tail and identity remain unchanged.
+pub fn mark_critical_heads(notes: &mut [Note]) {
+    let mut coverage = std::collections::HashMap::<_, Vec<(f64, f64)>>::new();
+    for n in notes.iter().filter(|n| n.kind == "CHR") {
+        coverage
+            .entry((n.tick.to_bits(), n.time.to_bits()))
+            .or_default()
+            .push((n.lane, n.lane + n.width));
+    }
+    for ranges in coverage.values_mut() {
+        ranges.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+    for n in notes
+        .iter_mut()
+        .filter(|n| matches!(n.kind.as_str(), "HLD_H" | "SLD_H"))
+    {
+        if let Some(ranges) = coverage.get(&(n.tick.to_bits(), n.time.to_bits())) {
+            let mut end = n.lane;
+            for &(left, right) in ranges {
+                if left > end {
+                    break;
+                }
+                end = end.max(right);
+                if end >= n.lane + n.width {
+                    n.critical = true;
+                    break;
+                }
+            }
+        }
     }
 }
 #[derive(Clone, Debug, Serialize)]
@@ -112,6 +146,7 @@ fn base(p: &[&str], resolution: f64) -> Result<Note> {
         time: 0.0,
         lane: num(p, 3)?,
         width: num(p, 4)?,
+        critical: false,
     };
     geometry(n.lane, n.width)?;
     Ok(n)
@@ -281,6 +316,7 @@ impl Chart {
                                             time: 0.0,
                                             lane: head.lane + (end_lane - head.lane) * r,
                                             width: head.width + (end_width - head.width) * r,
+                                            critical: false,
                                         });
                                     }
                                 }
@@ -353,6 +389,7 @@ impl Chart {
             }
             n.time = t;
         }
+        mark_critical_heads(&mut c.notes);
         let times: Vec<_> = c
             .longs
             .iter()
