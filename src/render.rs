@@ -385,10 +385,9 @@ impl Canvas {
         points: &[(f64, f64)],
         yb: f64,
         yt: f64,
-        unit_start: f64,
-        unit_end: f64,
+        stops: Vec<tiny_skia::GradientStop>,
     ) {
-        use tiny_skia::{GradientStop, LinearGradient, Point, SpreadMode};
+        use tiny_skia::{LinearGradient, Point, SpreadMode};
         let clipped;
         let points = if let Some((left, right)) = self.clip_x {
             clipped = clip_x(points.to_vec(), left, right);
@@ -399,31 +398,6 @@ impl Canvas {
         if points.len() < 3 || yb <= yt {
             return;
         }
-        let color = |u: f64| {
-            let t = if u < 0.15 {
-                1.0 - u / 0.15
-            } else if u > 0.85 {
-                (u - 0.85) / 0.15
-            } else {
-                0.0
-            };
-            tiny_skia::Color::from_rgba8(
-                (253.0 * t) as u8,
-                (255.0 - 163.0 * t) as u8,
-                (255.0 - 10.0 * t) as u8,
-                230,
-            )
-        };
-        let mut stops = vec![GradientStop::new(0.0, color(unit_end))];
-        for u in [0.85, 0.15] {
-            if u > unit_start && u < unit_end {
-                stops.push(GradientStop::new(
-                    ((unit_end - u) / (unit_end - unit_start)) as f32,
-                    color(u),
-                ));
-            }
-        }
-        stops.push(GradientStop::new(1.0, color(unit_start)));
         let Some(shader) = LinearGradient::new(
             Point::from_xy(0.0, yt as f32),
             Point::from_xy(0.0, yb as f32),
@@ -455,7 +429,7 @@ impl Canvas {
         }
     }
 }
-fn slide_units(c: &Chart) -> Vec<(f64, f64)> {
+fn slide_chains(c: &Chart) -> Vec<Vec<usize>> {
     use std::collections::{HashMap, HashSet, VecDeque};
     let mut indices: Vec<_> = c
         .longs
@@ -519,15 +493,16 @@ fn slide_units(c: &Chart) -> Vec<(f64, f64)> {
         }
     }
     let head_set: HashSet<_> = heads.iter().copied().collect();
-    let mut units = vec![(0.0, 1.0); c.longs.len()];
+    let mut chains = Vec::new();
+    let mut assigned = vec![false; c.longs.len()];
     for head in heads {
         let mut chain = Vec::new();
         let mut current = Some(head);
-        let mut visited = HashSet::new();
         while let Some(i) = current {
-            if !visited.insert(i) {
+            if assigned[i] {
                 break;
             }
+            assigned[i] = true;
             chain.push(i);
             let n = &c.longs[i];
             current = begins
@@ -542,25 +517,19 @@ fn slide_units(c: &Chart) -> Vec<(f64, f64)> {
                 break;
             }
         }
-        let start = chain
-            .iter()
-            .map(|&i| c.longs[i].head.tick)
-            .fold(f64::INFINITY, f64::min);
-        let end = chain
-            .iter()
-            .map(|&i| c.longs[i].end_tick)
-            .fold(start, f64::max);
-        if end > start {
-            for i in chain {
-                let n = &c.longs[i];
-                units[i] = (
-                    (n.head.tick - start) / (end - start),
-                    (n.end_tick - start) / (end - start),
-                );
-            }
+        if !chain.is_empty() {
+            chains.push(chain);
         }
     }
-    units
+    // Degenerate zero-duration cycles have no graph head. Keep every record,
+    // without following a cycle forever or painting a segment twice.
+    for i in indices {
+        if !assigned[i] {
+            chains.push(vec![i]);
+        }
+    }
+    chains.sort_by_key(|chain| *chain.iter().min().unwrap());
+    chains
 }
 fn divisions(c: &Chart) -> Vec<(f64, String)> {
     let mut ticks: Vec<_> = c
@@ -638,7 +607,8 @@ fn air_color(k: &str, color: &str) -> Color {
         }
     }
 }
-#[allow(clippy::too_many_arguments)]
+// Only HOLD and AIR paths are drawn individually. Ground SLIDE segments are
+// joined below so rasterization never sees their internal horizontal edges.
 fn long_path(
     v: &mut Canvas,
     n: &crate::chart::LongNote,
@@ -646,11 +616,8 @@ fn long_path(
     y: &impl Fn(f64) -> f64,
     top: f64,
     bottom: f64,
-    unit: (f64, f64),
 ) {
     let air = n.head.kind.starts_with('A');
-    let style = n.head.slide_style.unwrap_or_default();
-    let hold = matches!(n.head.kind.as_str(), "HLD" | "HXD") || (!air && style == SlideStyle::Hold);
     let polygon = clip_y(
         vec![
             (x + n.head.lane * 10.0, y(n.head.time)),
@@ -661,27 +628,13 @@ fn long_path(
         top,
         bottom,
     );
-    if hold {
+    if !air {
         v.blend = tiny_skia::BlendMode::Lighten;
         v.path(&polygon, rgba(253, 186, 116, 204), None, true);
         v.blend = tiny_skia::BlendMode::SourceOver;
     } else {
-        if air {
-            if n.head.kind != "ALD" {
-                v.path(&polygon, rgba(74, 222, 128, 13), None, true);
-            }
-        } else if style == SlideStyle::Green {
-            // 2.40 uses a green body and a separate green center texture.
-            v.blend = tiny_skia::BlendMode::Lighten;
-            v.path(&polygon, rgba(74, 222, 128, 153), None, true);
-            v.blend = tiny_skia::BlendMode::SourceOver;
-        } else {
-            v.gradient(&polygon, y(n.head.time), y(n.end_time), unit.0, unit.1);
-        }
-        // 2.50 JointSlide drawing (0x00C2E550, branch 0x00C2F6E4): NCL
-        // skips only the center mesh. Body and endpoint resources are shared.
-        if !air && style == SlideStyle::NoCenterLine {
-            return;
+        if n.head.kind != "ALD" {
+            v.path(&polygon, rgba(74, 222, 128, 13), None, true);
         }
         let middle = clip_y(
             vec![
@@ -705,14 +658,132 @@ fn long_path(
             top,
             bottom,
         );
-        if !air {
-            v.blend = tiny_skia::BlendMode::Lighten;
+        v.path(&middle, air_color(&n.head.kind, &n.color), None, true);
+        v.blend = tiny_skia::BlendMode::SourceOver;
+    }
+}
+
+fn slide_color(unit: f64) -> tiny_skia::Color {
+    let t = if unit < 0.15 {
+        1.0 - unit / 0.15
+    } else if unit > 0.85 {
+        (unit - 0.85) / 0.15
+    } else {
+        0.0
+    }
+    .clamp(0.0, 1.0) as f32;
+    tiny_skia::Color::from_rgba(
+        253.0 / 255.0 * t,
+        1.0 - 163.0 / 255.0 * t,
+        1.0 - 10.0 / 255.0 * t,
+        230.0 / 255.0,
+    )
+    .unwrap()
+}
+
+fn slide_path(
+    v: &mut Canvas,
+    c: &Chart,
+    chain: &[usize],
+    x: f64,
+    y: &impl Fn(f64) -> f64,
+    top: f64,
+    bottom: f64,
+) {
+    let first = &c.longs[chain[0]];
+    let last = &c.longs[*chain.last().unwrap()];
+    let start = first.head.tick;
+    let end = last.end_tick;
+    if end <= start {
+        return;
+    }
+    let style = first.head.slide_style.unwrap_or_default();
+    let mut sections = vec![(first.head.time, first.head.lane, first.head.width)];
+    sections.extend(chain.iter().map(|&i| {
+        let n = &c.longs[i];
+        (n.end_time, n.end_lane, n.end_width)
+    }));
+    // Removing redundant collinear samples also makes the outer edge stable
+    // when Skia converts vertices to f32, especially after track clipping.
+    let mut corners: Vec<(f64, f64, f64)> = Vec::new();
+    for p in sections {
+        while corners.len() >= 2 {
+            let a = corners[corners.len() - 2];
+            let b = corners[corners.len() - 1];
+            if p.0 <= a.0 {
+                break;
+            }
+            let u = (b.0 - a.0) / (p.0 - a.0);
+            let linear = |start: f64, middle: f64, end: f64| {
+                (middle - (start + (end - start) * u)).abs()
+                    <= 32.0 * f64::EPSILON * start.abs().max(end.abs()).max(1.0)
+            };
+            if !linear(a.1, b.1, p.1) || !linear(a.2, b.2, p.2) {
+                break;
+            }
+            corners.pop();
         }
+        corners.push(p);
+    }
+    let outline = |center: bool| {
+        let edge = |&(time, lane, width): &(f64, f64, f64), right: bool| {
+            let xx = if center {
+                x + (lane + width / 2.0) * 10.0 + if right { 3.5 } else { -3.5 }
+            } else {
+                x + (lane + if right { width } else { 0.0 }) * 10.0
+            };
+            (xx, y(time))
+        };
+        let points = corners
+            .iter()
+            .map(|p| edge(p, false))
+            .chain(corners.iter().rev().map(|p| edge(p, true)))
+            .collect();
+        clip_y(points, top, bottom)
+    };
+    let body = outline(false);
+    v.blend = tiny_skia::BlendMode::Lighten;
+    match style {
+        SlideStyle::Hold => v.path(&body, rgba(253, 186, 116, 204), None, true),
+        SlideStyle::Green => v.path(&body, rgba(74, 222, 128, 153), None, true),
+        _ => {
+            // The gradient follows chart ticks over the whole connected route.
+            // BPM changes are shader knots, not new polygons. Adding/removing
+            // source subdivisions therefore cannot restart or quantize it.
+            let fade_in = start + (end - start) * 0.15;
+            let fade_out = start + (end - start) * 0.85;
+            let mut ticks = vec![start, fade_in, fade_out, end];
+            ticks.extend(
+                c.tempos
+                    .iter()
+                    .map(|b| b.tick)
+                    .filter(|&t| t > start && t < end && (t < fade_in || t > fade_out)),
+            );
+            ticks.sort_by(f64::total_cmp);
+            ticks.dedup();
+            let yb = y(first.head.time);
+            let yt = y(last.end_time);
+            if yb > yt {
+                let stops = ticks
+                    .iter()
+                    .rev()
+                    .map(|&tick| {
+                        tiny_skia::GradientStop::new(
+                            ((y(c.seconds_at(tick)) - yt) / (yb - yt)).clamp(0.0, 1.0) as f32,
+                            slide_color((tick - start) / (end - start)),
+                        )
+                    })
+                    .collect();
+                v.gradient(&body, yb, yt, stops);
+            }
+        }
+    }
+    // NCL and legacy HLD omit the stripe; ordinary and GRN keep one
+    // continuous stripe with the same bends and clipping as the body.
+    if matches!(style, SlideStyle::Slide | SlideStyle::Green) {
         v.path(
-            &middle,
-            if air {
-                air_color(&n.head.kind, &n.color)
-            } else if style == SlideStyle::Green {
+            &outline(true),
+            if style == SlideStyle::Green {
                 rgba(134, 239, 172, 255)
             } else {
                 rgba(0, 255, 255, 255)
@@ -720,8 +791,8 @@ fn long_path(
             None,
             true,
         );
-        v.blend = tiny_skia::BlendMode::SourceOver;
     }
+    v.blend = tiny_skia::BlendMode::SourceOver;
 }
 fn glyph(v: &mut Canvas, n: &crate::chart::Note, x: f64, yy: f64, top: f64, bottom: f64) {
     let xx = x + n.lane * 10.0 + 1.0;
@@ -1040,7 +1111,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
     } else {
         Vec::new()
     };
-    let units = slide_units(c);
+    let slides = slide_chains(c);
     let divs = if o.divisions {
         divisions(c)
     } else {
@@ -1146,14 +1217,19 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
         }
         v.clip_x = Some((x, x + 160.0));
         for layer in 2..=5 {
-            for (i, n) in c.longs.iter().enumerate() {
+            for n in &c.longs {
                 let hold = matches!(n.head.kind.as_str(), "HLD" | "HXD");
-                if n.end_time >= start
-                    && n.head.time < end
-                    && !n.head.kind.starts_with('A')
-                    && ((layer == 2 && hold) || (layer == 4 && !hold))
-                {
-                    long_path(&mut v, n, x, &y, top, bottom, units[i]);
+                if n.end_time >= start && n.head.time < end && layer == 2 && hold {
+                    long_path(&mut v, n, x, &y, top, bottom);
+                }
+            }
+            if layer == 4 {
+                for chain in &slides {
+                    let first = &c.longs[chain[0]];
+                    let last = &c.longs[*chain.last().unwrap()];
+                    if last.end_time >= start && first.head.time < end {
+                        slide_path(&mut v, c, chain, x, &y, top, bottom);
+                    }
                 }
             }
             if !o.shows_judgements() {
@@ -1179,9 +1255,9 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
                 glyph(&mut v, n, x, y(n.time), top, bottom);
             }
         }
-        for (i, n) in c.longs.iter().enumerate() {
+        for n in &c.longs {
             if n.end_time >= start && n.head.time < end && n.head.kind.starts_with('A') {
-                long_path(&mut v, n, x, &y, top, bottom, units[i]);
+                long_path(&mut v, n, x, &y, top, bottom);
             }
         }
         for n in &notes {
