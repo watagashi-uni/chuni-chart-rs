@@ -123,6 +123,19 @@ ETag 使用 HMAC-SHA-256，包含谱面内容、标准化后的模式 / 难度 /
 
 Chunibot 的 `newchart` / `chujudge` 可将 `CHUNIBOT_CHART_PNG_URL` 指向本服务的 `/api/render`，并启用 `CHUNIBOT_CHART_ETAG_ENABLED=1`。其 `name`、`judge`、`div` 和 `If-None-Match` 参数均可直接使用。本项目不会修改 Chunibot 配置或缓存。
 
+## 访问日志
+
+启动服务后默认向控制台的标准错误输出访问日志，每个 HTTP 请求一行。例如：
+
+```text
+2026-11-03T12:00:00+08:00: [render] "GET /api/render/1086_03?div=0 HTTP/1.1" 200 1412835 830.5ms
+2026-11-03T12:00:02+08:00: [render] "GET /api/render/1086_03?div=0 HTTP/1.1" 304 0 0.6ms
+```
+
+依次是服务器本地时间和时区、请求方法及地址、HTTP 版本、状态码、生成的响应正文大小（字节）和耗时。耗时包含排队、读取和渲染，不包含客户端下载图片的时间。成功、304 缓存命中及失败请求都会记录；检查服务的 `/healthz` 请求也会记录。
+
+日志不记录请求头、配置盐或谱面正文；未知查询参数会显示为 `[redacted]`，长字段会截断，控制字符会转义。日志在独立线程写入，最多缓冲 512 行，输出长期阻塞时丢弃超出的记录并在恢复后汇总数量，避免影响 API 请求。日志可直接由运行服务的终端或服务管理器收集。
+
 ## 命令行出图
 
 ```sh
@@ -191,6 +204,7 @@ cargo build --release --locked
 python3 scripts/smoke.py
 python3 scripts/security_http.py
 python3 scripts/queue_http.py
+python3 scripts/access_log.py
 cargo audit --deny unsound
 ```
 

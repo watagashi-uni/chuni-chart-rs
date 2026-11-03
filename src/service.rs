@@ -397,6 +397,7 @@ async fn generate(
     }
 }
 async fn response_policy(request: Request<axum::body::Body>, next: Next) -> Response {
+    let log = crate::access_log::Entry::start(&request);
     let mut response = if request.uri().to_string().len() > 2048 {
         error(StatusCode::URI_TOO_LONG, "Request URI too long")
     } else if request
@@ -433,6 +434,7 @@ async fn response_policy(request: Request<axum::body::Body>, next: Next) -> Resp
     if !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
+    log.finish(&response);
     response
 }
 

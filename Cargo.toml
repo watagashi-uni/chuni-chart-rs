@@ -1,6 +1,6 @@
 [package]
 name = "chuni-chart-rs"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Direct C2S chart image renderer and bounded HTTP service"
@@ -21,6 +21,7 @@ libc = "0.2"
 hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.3"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }

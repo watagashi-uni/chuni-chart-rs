@@ -26,8 +26,9 @@ def server(config_path):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
+    log = tempfile.TemporaryFile()
     proc = subprocess.Popen([binary, 'serve', '--config', str(config_path), '--listen', f'127.0.0.1:{port}'],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                            stdout=subprocess.DEVNULL, stderr=log)
     def request(path, headers=None, method='GET'):
         req = urllib.request.Request(f'http://127.0.0.1:{port}{path}', headers=headers or {}, method=method)
         try:
@@ -49,11 +50,14 @@ def server(config_path):
     finally:
         proc.terminate()
         try:
-            _, stderr = proc.communicate(timeout=10)
+            proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
-            _, stderr = proc.communicate(timeout=5)
+            proc.communicate(timeout=5)
             raise AssertionError('server did not stop')
+        log.seek(0)
+        stderr = log.read()
+        log.close()
         assert marker.encode() not in stderr and salt.encode() not in stderr, 'Source/secret in server log'
 
 

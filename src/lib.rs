@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+mod access_log;
 pub mod chart;
 pub mod config;
 mod etag;
