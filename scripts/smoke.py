@@ -27,7 +27,7 @@ with tempfile.TemporaryDirectory() as directory:
     config = root / 'server.json'
     config.write_text(json.dumps({'chart_dir': directory, 'render_workers': 1,
                                   'queue_capacity': 16, 'queue_timeout_seconds': 20,
-                                  'timeout_seconds': 2}), encoding='utf-8')
+                                  'timeout_seconds': 5}), encoding='utf-8')
     process = subprocess.Popen([binary, 'serve', '--config', str(config), '--listen', f'127.0.0.1:{port}'], stderr=subprocess.PIPE)
     def request(path, headers=None, include_headers=False):
         try:

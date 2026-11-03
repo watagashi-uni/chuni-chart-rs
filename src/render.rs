@@ -44,7 +44,10 @@ pub struct Dimensions {
     pub pixels_per_second: f64,
     pub columns: usize,
 }
-const MAX_PIXELS: f64 = 12_000_000.0;
+// Preserve native text size on wide full-chart images (e.g. 41 columns), with
+// a fallback budget that still fits the 256 MiB render-worker limit.
+const MAX_PIXELS: f64 = 40_000_000.0;
+const MAX_SIDE: f64 = 32768.0;
 const STRIDE: f64 = 248.0;
 const FOOT: f64 = 42.0;
 type Color = [u8; 4];
@@ -92,8 +95,8 @@ pub fn dimensions(c: &Chart, o: &Options) -> Result<Dimensions> {
     let scale = (MAX_PIXELS / (w * h))
         .sqrt()
         .min(1.0)
-        .min(16384.0 / w)
-        .min(16384.0 / h);
+        .min(MAX_SIDE / w)
+        .min(MAX_SIDE / h);
     Ok(Dimensions {
         width: (w * scale).floor() as u32,
         height: (h * scale).floor() as u32,
@@ -844,7 +847,9 @@ fn draw_judgements(
                 }
                 let xl = x + (first + i) as f64 * 10.0;
                 let rect = [xl, yt, xl + (j - i) as f64 * 10.0, yb];
-                if band.grade == "ATTACK" && (yb - yt) * v.scale as f64 <= 2.0 + 1e-9 {
+                // The raster scale is f32; allow its subpixel rounding at the
+                // two-pixel boundary when deciding whether to boost a thin strip.
+                if band.grade == "ATTACK" && (yb - yt) * v.scale as f64 <= 2.0 + 1e-6 {
                     thin_attacks.push(rect);
                 } else {
                     let index = match band.grade {

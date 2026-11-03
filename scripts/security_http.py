@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -85,6 +86,8 @@ with tempfile.TemporaryDirectory() as directory:
     for name, padding in [('limit', b'x'), ('escaped-limit', b'\x01')]:
         prefix = source.encode() + b'//'
         (charts / f'{name}.c2s').write_bytes(prefix + padding * (limit - len(prefix)))
+    (charts / 'wide.c2s').write_text('BPM_DEF 120\nTAP 0 0 0 4\nTAP 161 383 0 4\n', encoding='utf-8')
+    (charts / 'budget.c2s').write_text('BPM_DEF 120\nTAP 0 0 0 4\nTAP 299 383 0 4\n', encoding='utf-8')
     (charts / 'directory.c2s').mkdir()
     outside = root / 'outside.c2s'
     outside.write_text(source.replace('0 4', '4 4'), encoding='utf-8')
@@ -99,7 +102,7 @@ with tempfile.TemporaryDirectory() as directory:
     if hasattr(os, 'mkfifo'):
         os.mkfifo(charts / 'pipe.c2s')
     config = settings / 'server.json'
-    config.write_text(json.dumps({'chart_dir': '../charts', 'etag_salt': salt, 'timeout_seconds': 2}), encoding='utf-8')
+    config.write_text(json.dumps({'chart_dir': '../charts', 'etag_salt': salt, 'timeout_seconds': 10}), encoding='utf-8')
     # Config source and salt must not be exposed, even when copied into chart_dir.
     (charts / 'config.json').write_text(config.read_text(encoding='utf-8'), encoding='utf-8')
 
@@ -111,6 +114,13 @@ with tempfile.TemporaryDirectory() as directory:
             limit_tag, limit_png = image(request(f'/api/render/{name}'))
             assert limit_png == png, 'Input padding changed rendered chart'
             assert request(f'/api/render/{name}', {'If-None-Match': limit_tag})[0] == 304
+        _, wide_png = image(request('/judge?name=wide'))
+        assert struct.unpack('>II', wide_png[16:24]) == (10216, 3068)
+        _, budget_png = image(request('/judge?name=budget'))
+        width, height = struct.unpack('>II', budget_png[16:24])
+        assert 39_900_000 < width * height <= 40_000_000 and max(width, height) <= 32768
+        status, _, budget_jpeg = request('/judge?name=budget&format=jpg')
+        assert status == 200 and budget_jpeg.startswith(b'\xff\xd8'), (status, budget_jpeg[:100])
         assert image(request('/api/render/1086_03')) == (tag, png)
         assert image(request('/preview?name=1086_03.c2s')) == (tag, png)
         for validator in (tag, tag.removeprefix('W/'), '"unrelated", ' + tag, '*'):
@@ -205,4 +215,4 @@ with tempfile.TemporaryDirectory() as directory:
     print(json.dumps({'conditional_get': 'pass', 'option_validators': 'pass', 'persistent_salt': 'pass',
                       'fastattack_api': 'pass', 'path_and_source_isolation': 'pass',
                       'symlink_rejection': 'pass' if symlinks else 'skipped (Windows symlink privilege unavailable)',
-                      'input_20_mib_boundary': 'pass', 'request_limits': 'pass', 'security_headers': 'pass'}))
+                      'wide_native_resolution_and_40mp_worker_budget': 'pass', 'input_20_mib_boundary': 'pass', 'request_limits': 'pass', 'security_headers': 'pass'}))

@@ -7,14 +7,18 @@ pub struct Layout {
     pub ranges: Vec<(f64, f64)>,
 }
 fn trimmed_mean(mut values: Vec<f64>) -> f64 {
-    values.retain(|v| v.is_finite() && *v > 0.0);
+    // Upstream inserts subdivisions of long measures before measure starts.
+    // That order can produce negative spans; retain them until the symmetric
+    // trim, otherwise an extra short positive span is removed from the mean.
+    values.retain(|v| v.is_finite());
     values.sort_by(f64::total_cmp);
     let cut = if values.len() > 10 { 5 } else { 0 };
     let vs = &values[cut..values.len() - cut];
     if vs.is_empty() {
         2.0
     } else {
-        vs.iter().sum::<f64>() / vs.len() as f64
+        let mean = vs.iter().sum::<f64>() / vs.len() as f64;
+        if mean > 0.0 { mean } else { 2.0 }
     }
 }
 pub fn layout(c: &Chart, zoom: f64) -> Layout {
