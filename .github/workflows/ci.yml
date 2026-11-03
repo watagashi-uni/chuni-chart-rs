@@ -46,6 +46,8 @@ jobs:
         run: python scripts/smoke.py target/${{ matrix.target }}/release/${{ matrix.executable }}
       - name: Check conditional GET and source isolation
         run: python scripts/security_http.py target/${{ matrix.target }}/release/${{ matrix.executable }}
+      - name: Check parallel rendering and bounded queue
+        run: python scripts/queue_http.py target/${{ matrix.target }}/release/${{ matrix.executable }}
       - name: Package executable and public example configuration
         run: python scripts/package.py --platform ${{ matrix.platform }} --binary target/${{ matrix.target }}/release/${{ matrix.executable }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

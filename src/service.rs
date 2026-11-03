@@ -3,6 +3,7 @@ use crate::{
     MAX_INPUT_BYTES, MAX_OUTPUT_BYTES, Result,
     config::Config,
     etag::{self, EtagKey},
+    queue::{QueueError, RenderPermit, RenderQueue},
     render::Options,
     storage::{ChartRoot, ReadError},
 };
@@ -29,7 +30,7 @@ struct App {
     root: Arc<ChartRoot>,
     etag: EtagKey,
     reads: Arc<Semaphore>,
-    slots: Arc<Semaphore>,
+    queue: Arc<RenderQueue>,
     timeout: Duration,
 }
 #[derive(Serialize, Deserialize)]
@@ -127,12 +128,14 @@ pub async fn run_worker(job: Job, timeout: Duration) -> Result<Vec<u8>> {
     let mut stdin = child.stdin.take().ok_or("Worker stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("Worker stdout unavailable")?;
     let payload = serde_json::to_vec(&job).map_err(|_| "Cannot encode worker input")?;
+    drop(job);
     let result = tokio::time::timeout(timeout, async {
         stdin
             .write_all(&payload)
             .await
             .map_err(|_| "Worker input failed")?;
         drop(stdin);
+        drop(payload);
         let mut bytes = Vec::new();
         stdout
             .take(MAX_OUTPUT_BYTES as u64 + 1)
@@ -167,7 +170,7 @@ pub async fn run_worker(job: Job, timeout: Duration) -> Result<Vec<u8>> {
 // Small frames also bound hyper's pending write buffer for slow readers.
 struct ImageBody {
     bytes: axum::body::Bytes,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: RenderPermit,
 }
 impl http_body::Body for ImageBody {
     type Data = axum::body::Bytes;
@@ -227,12 +230,23 @@ async fn named_fastattack(
 ) -> Response {
     generate(app, headers, query, Mode::FastAttack, Some(name)).await
 }
-fn busy() -> Response {
-    let mut response = error(StatusCode::TOO_MANY_REQUESTS, "Renderer busy; retry later");
+fn busy(reason: QueueError) -> Response {
+    let message = match reason {
+        QueueError::Full => "Render queue full; retry later",
+        QueueError::TimedOut => "Render queue wait timed out; retry later",
+    };
+    let mut response = error(StatusCode::TOO_MANY_REQUESTS, message);
     response
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
     response
+}
+fn read_error(reason: ReadError) -> Response {
+    match reason {
+        ReadError::NotFound => error(StatusCode::NOT_FOUND, "Chart not found"),
+        ReadError::TooLarge => error(StatusCode::BAD_REQUEST, "Chart exceeds input limit"),
+        ReadError::Invalid => error(StatusCode::UNPROCESSABLE_ENTITY, "Cannot read chart"),
+    }
 }
 fn cache_headers(response: &mut Response, tag: &str) {
     response.headers_mut().insert(
@@ -301,11 +315,37 @@ async fn generate(
         column: p.column,
         zoom,
     };
-    // Bounded file I/O runs outside async runtime threads. Keep the permit with
-    // the returned bytes so concurrent prepared requests cannot accumulate them.
-    let Ok(read_permit) = app.reads.clone().try_acquire_owned() else {
-        return busy();
+    // Conditional hits can bypass a busy render queue. Keep these reads bounded;
+    // if all validation readers are busy, use the ordinary bounded queue.
+    if headers.contains_key(header::IF_NONE_MATCH)
+        && let Ok(read_permit) = app.reads.clone().try_acquire_owned()
+    {
+        let root = app.root.clone();
+        let key = app.etag.clone();
+        let read_name = name.clone();
+        let hash_options = options.clone();
+        let validation = tokio::task::spawn_blocking(move || {
+            let result = root
+                .read(&read_name)
+                .map(|chart| key.tag(&chart, &hash_options));
+            // Cancellation cannot release the read slot while I/O still runs.
+            drop(read_permit);
+            result
+        })
+        .await;
+        match validation {
+            Ok(Ok(tag)) if etag::matches(&headers, &tag) => return not_modified(&tag),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return read_error(e),
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read chart"),
+        }
+    }
+    let permit = match app.queue.acquire().await {
+        Ok(permit) => permit,
+        Err(reason) => return busy(reason),
     };
+    // Read only after reaching the front of the queue. In particular, a chart
+    // changed while waiting gets a fresh ETag from the exact bytes rendered.
     let root = app.root.clone();
     let key = app.etag.clone();
     let hash_options = options.clone();
@@ -314,29 +354,20 @@ async fn generate(
             let tag = key.tag(&chart, &hash_options);
             (chart, tag)
         });
-        (result, read_permit)
+        (result, permit)
     })
     .await;
-    let Ok((prepared, _read_permit)) = prepared else {
+    let Ok((prepared, permit)) = prepared else {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read chart");
     };
     let (chart, tag) = match prepared {
         Ok(pair) => pair,
-        Err(ReadError::NotFound) => return error(StatusCode::NOT_FOUND, "Chart not found"),
-        Err(ReadError::TooLarge) => {
-            return error(StatusCode::BAD_REQUEST, "Chart exceeds input limit");
-        }
-        Err(ReadError::Invalid) => {
-            return error(StatusCode::UNPROCESSABLE_ENTITY, "Cannot read chart");
-        }
+        Err(e) => return read_error(e),
     };
-    // Matching content validators bypass the render slot and subprocess entirely.
+    // Recheck validators after waiting, using the same bytes as the worker.
     if etag::matches(&headers, &tag) {
         return not_modified(&tag);
     }
-    let Ok(permit) = app.slots.clone().try_acquire_owned() else {
-        return busy();
-    };
     let content = if options.format == "png" {
         "image/png"
     } else {
@@ -411,7 +442,11 @@ pub fn router_with_config(config: &Config) -> Result<Router> {
         root: Arc::new(ChartRoot::open(&config.chart_dir)?),
         etag: EtagKey::new(config.etag_salt.as_deref())?,
         reads: Arc::new(Semaphore::new(4)),
-        slots: Arc::new(Semaphore::new(1)),
+        queue: Arc::new(RenderQueue::new(
+            config.render_workers,
+            config.queue_capacity,
+            Duration::from_secs(config.queue_timeout_seconds),
+        )),
         timeout: Duration::from_secs(config.timeout_seconds),
     };
     Ok(Router::new()
@@ -454,8 +489,11 @@ pub async fn serve_config(config: Config) -> Result<()> {
         .await
         .map_err(|_| "Cannot bind listen address")?;
     eprintln!(
-        "Listening on {} (one bounded render worker)",
-        listener.local_addr().map_err(|_| "Address unavailable")?
+        "Listening on {} ({} render workers, {} queued requests, {}s queue wait)",
+        listener.local_addr().map_err(|_| "Address unavailable")?,
+        config.render_workers,
+        config.queue_capacity,
+        config.queue_timeout_seconds,
     );
     if config.etag_salt.is_none() {
         eprintln!(

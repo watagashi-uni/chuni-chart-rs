@@ -4,6 +4,7 @@ pub mod config;
 mod etag;
 pub mod judgement;
 pub mod layout;
+mod queue;
 pub mod render;
 pub mod service;
 mod storage;

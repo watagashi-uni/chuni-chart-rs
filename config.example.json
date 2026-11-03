@@ -2,5 +2,8 @@
   "chart_dir": "charts",
   "listen": "127.0.0.1:3000",
   "timeout_seconds": 15,
+  "render_workers": 4,
+  "queue_capacity": 32,
+  "queue_timeout_seconds": 30,
   "etag_salt": null
 }

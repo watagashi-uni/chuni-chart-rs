@@ -13,6 +13,9 @@ fn config_paths_are_relative_to_file_and_secrets_never_echo_in_errors() {
     let config = Config::load(Some(&path)).unwrap();
     assert_eq!(config.chart_dir, dir.path().join("c2s"));
     assert_eq!(config.timeout_seconds, 4);
+    assert_eq!(config.render_workers, 4);
+    assert_eq!(config.queue_capacity, 32);
+    assert_eq!(config.queue_timeout_seconds, 30);
     config.validate().unwrap();
     fs::write(
         &path,
@@ -60,6 +63,44 @@ fn init_config_is_private_unique_and_never_overwrites() {
 
 #[test]
 fn invalid_service_settings_fail_closed() {
+    for workers in [0, 17, usize::MAX] {
+        assert!(
+            Config {
+                render_workers: workers,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    for capacity in [129, usize::MAX] {
+        assert!(
+            Config {
+                queue_capacity: capacity,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    for seconds in [0, 121, u64::MAX] {
+        assert!(
+            Config {
+                queue_timeout_seconds: seconds,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    assert!(
+        Config {
+            queue_capacity: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok()
+    );
     for seconds in [0, 31, u64::MAX] {
         assert!(
             Config {

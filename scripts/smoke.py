@@ -24,11 +24,15 @@ with tempfile.TemporaryDirectory() as directory:
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
-    process = subprocess.Popen([binary, 'serve', '--chart-dir', directory, '--listen', f'127.0.0.1:{port}', '--timeout', '2'], stderr=subprocess.PIPE)
+    config = root / 'server.json'
+    config.write_text(json.dumps({'chart_dir': directory, 'render_workers': 1,
+                                  'queue_capacity': 16, 'queue_timeout_seconds': 20,
+                                  'timeout_seconds': 2}), encoding='utf-8')
+    process = subprocess.Popen([binary, 'serve', '--config', str(config), '--listen', f'127.0.0.1:{port}'], stderr=subprocess.PIPE)
     def request(path, headers=None, include_headers=False):
         try:
             req = urllib.request.Request(f'http://127.0.0.1:{port}{path}', headers=headers or {})
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 result = (response.status, response.read())
                 return (*result, response.headers) if include_headers else result
         except urllib.error.HTTPError as error:
@@ -65,7 +69,7 @@ with tempfile.TemporaryDirectory() as directory:
             assert request('/healthz')[0] == 200
             results = [job.result() for job in jobs]
         summary = [(status, len(body)) for status, body in results]
-        assert any(status == 429 for status, _ in results), summary
+        assert all(status == 200 for status, _ in results), summary
         # Rendering got faster with bounded pair scans. Do not require a valid
         # chart to be slow: freeze our own worker to exercise wall-time cleanup.
         timeout_checked = False
@@ -89,7 +93,9 @@ with tempfile.TemporaryDirectory() as directory:
                 # Matching validators must work while the only render slot is busy.
                 cached = request('/preview?name=demo', {'If-None-Match': cache_headers['ETag']})
                 assert cached == (304, b''), cached
-                assert request('/preview?name=demo&zoom=2')[0] == 429
+                # This request waits for the frozen worker to time out, then
+                # succeeds without a client retry.
+                assert request('/preview?name=demo&zoom=2')[0] == 200
                 status, body = job.result()
                 assert status == 422 and b'timed out' in body, (status, body[:100])
         assert request('/healthz')[0] == 200
@@ -101,7 +107,7 @@ with tempfile.TemporaryDirectory() as directory:
             for task in Path(f'/proc/{process.pid}/task').iterdir():
                 children.extend((task / 'children').read_text().split())
             assert not children, children
-        print(json.dumps({'http_images': 'pass', 'early_attack_mode': 'pass', 'malformed_input': 'pass', 'oversize_input': 'pass', 'concurrency_429': 'pass', 'conditional_hit_while_busy': 'pass' if timeout_checked else 'skipped (requires Linux /proc)', 'timeout_and_recovery': 'pass' if timeout_checked else 'skipped (requires Linux /proc)', 'child_reaping': 'pass' if sys.platform == 'linux' else 'skipped'}))
+        print(json.dumps({'http_images': 'pass', 'early_attack_mode': 'pass', 'malformed_input': 'pass', 'oversize_input': 'pass', 'concurrent_requests_wait': 'pass', 'conditional_hit_while_busy': 'pass' if timeout_checked else 'skipped (requires Linux /proc)', 'timeout_and_recovery': 'pass' if timeout_checked else 'skipped (requires Linux /proc)', 'child_reaping': 'pass' if sys.platform == 'linux' else 'skipped'}))
     finally:
         process.terminate()
         process.wait(timeout=10)

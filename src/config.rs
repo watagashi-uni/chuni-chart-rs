@@ -14,6 +14,9 @@ pub struct Config {
     pub chart_dir: PathBuf,
     pub listen: String,
     pub timeout_seconds: u64,
+    pub render_workers: usize,
+    pub queue_capacity: usize,
+    pub queue_timeout_seconds: u64,
     pub etag_salt: Option<String>,
 }
 impl Default for Config {
@@ -22,6 +25,9 @@ impl Default for Config {
             chart_dir: "charts".into(),
             listen: "127.0.0.1:3000".into(),
             timeout_seconds: 15,
+            render_workers: 4,
+            queue_capacity: 32,
+            queue_timeout_seconds: 30,
             etag_salt: None,
         }
     }
@@ -73,6 +79,15 @@ impl Config {
         }
         if !(1..=30).contains(&self.timeout_seconds) {
             return Err("timeout_seconds must be between 1 and 30".into());
+        }
+        if !(1..=16).contains(&self.render_workers) {
+            return Err("render_workers must be between 1 and 16".into());
+        }
+        if self.queue_capacity > 128 {
+            return Err("queue_capacity must be between 0 and 128".into());
+        }
+        if !(1..=120).contains(&self.queue_timeout_seconds) {
+            return Err("queue_timeout_seconds must be between 1 and 120".into());
         }
         if self
             .etag_salt

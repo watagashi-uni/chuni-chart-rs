@@ -157,7 +157,9 @@ fn run() -> Result<()> {
                 return Err("Worker input too large".into());
             }
             let job: Job = serde_json::from_slice(&input).map_err(|_| "Invalid worker input")?;
+            drop(input);
             let c = Chart::parse(&job.chart)?;
+            drop(job.chart);
             let bytes = render::render(&c, &job.options)?;
             std::io::stdout()
                 .write_all(&bytes)
