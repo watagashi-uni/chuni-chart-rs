@@ -78,7 +78,13 @@ with tempfile.TemporaryDirectory() as directory:
     chart.write_text(source, encoding='utf-8')
     (charts / 'invalid.c2s').write_text(marker, encoding='utf-8')
     (charts / 'binary.c2s').write_bytes(b'\xff\x00' + marker.encode())
-    (charts / 'large.c2s').write_bytes(b' ' * (2 * 1024 * 1024 + 1))
+    (charts / 'large.c2s').write_bytes(b' ' * (20 * 1024 * 1024 + 1))
+    # Exact size boundary, including the worst JSON escape expansion inside
+    # an ignored comment. Exercise the real reader and bounded worker together.
+    limit = 20 * 1024 * 1024
+    for name, padding in [('limit', b'x'), ('escaped-limit', b'\x01')]:
+        prefix = source.encode() + b'//'
+        (charts / f'{name}.c2s').write_bytes(prefix + padding * (limit - len(prefix)))
     (charts / 'directory.c2s').mkdir()
     outside = root / 'outside.c2s'
     outside.write_text(source.replace('0 4', '4 4'), encoding='utf-8')
@@ -101,6 +107,10 @@ with tempfile.TemporaryDirectory() as directory:
         base = '/api/render?name=1086_03'
         tag, png = image(request(base))
         assert hashlib.sha256(source.encode()).hexdigest() not in tag, 'Unsalted source digest leaked'
+        for name in ('limit', 'escaped-limit'):
+            limit_tag, limit_png = image(request(f'/api/render/{name}'))
+            assert limit_png == png, 'Input padding changed rendered chart'
+            assert request(f'/api/render/{name}', {'If-None-Match': limit_tag})[0] == 304
         assert image(request('/api/render/1086_03')) == (tag, png)
         assert image(request('/preview?name=1086_03.c2s')) == (tag, png)
         for validator in (tag, tag.removeprefix('W/'), '"unrelated", ' + tag, '*'):
@@ -195,4 +205,4 @@ with tempfile.TemporaryDirectory() as directory:
     print(json.dumps({'conditional_get': 'pass', 'option_validators': 'pass', 'persistent_salt': 'pass',
                       'fastattack_api': 'pass', 'path_and_source_isolation': 'pass',
                       'symlink_rejection': 'pass' if symlinks else 'skipped (Windows symlink privilege unavailable)',
-                      'request_limits': 'pass', 'security_headers': 'pass'}))
+                      'input_20_mib_boundary': 'pass', 'request_limits': 'pass', 'security_headers': 'pass'}))

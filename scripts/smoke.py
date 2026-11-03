@@ -19,7 +19,7 @@ with tempfile.TemporaryDirectory() as directory:
     (root / 'demo.c2s').write_text((Path(__file__).resolve().parents[1] / 'tests/fixtures/demo.c2s').read_text())
     (root / 'overflow.c2s').write_text('BPM_DEF 120\nTAP 0 96 -2 4\nSLD 0 0 -16 4 384 28 4')
     (root / 'bad.c2s').write_text('BPM_DEF NaN\nTAP 0 0 0 1')
-    (root / 'large.c2s').write_bytes(b' ' * (2 * 1024 * 1024 + 1))
+    (root / 'large.c2s').write_bytes(b' ' * (20 * 1024 * 1024 + 1))
     (root / 'slow.c2s').write_text('BPM_DEF 120\n' + '\n'.join(f'TAP 0 {i*4} 0 16' for i in range(11000)))
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))

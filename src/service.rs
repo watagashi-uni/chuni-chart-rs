@@ -78,7 +78,7 @@ pub fn read_chart(path: &Path) -> Result<String> {
         .read_to_end(&mut bytes)
         .map_err(|_| "Cannot read chart")?;
     if bytes.len() > MAX_INPUT_BYTES {
-        return Err("Chart exceeds 2 MiB input limit".into());
+        return Err("Chart exceeds 20 MiB input limit".into());
     }
     String::from_utf8(bytes).map_err(|_| "Chart must be UTF-8".into())
 }

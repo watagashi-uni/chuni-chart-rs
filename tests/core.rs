@@ -36,7 +36,26 @@ fn malformed_and_expanding_inputs() {
     ] {
         assert!(Chart::parse(source).is_err(), "accepted: {source}");
     }
-    assert!(Chart::parse(&" ".repeat(2 * 1024 * 1024 + 1)).is_err());
+}
+#[test]
+fn input_size_boundary_in_parser_and_cli_reader() {
+    let mut source = String::from(SIMPLE);
+    source.push_str("//");
+    source.extend(std::iter::repeat_n('x', 20 * 1024 * 1024 - source.len()));
+    assert!(Chart::parse(&source).is_ok());
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &source).unwrap();
+    assert_eq!(service::read_chart(file.path()).unwrap(), source);
+    source.push('x');
+    assert_eq!(
+        Chart::parse(&source).unwrap_err(),
+        "Chart exceeds 20 MiB input limit"
+    );
+    std::fs::write(file.path(), &source).unwrap();
+    assert_eq!(
+        service::read_chart(file.path()).unwrap_err(),
+        "Chart exceeds 20 MiB input limit"
+    );
 }
 #[derive(Deserialize)]
 struct Case {

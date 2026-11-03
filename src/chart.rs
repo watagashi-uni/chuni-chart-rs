@@ -171,7 +171,7 @@ impl Chart {
     }
     pub fn parse(text: &str) -> Result<Self> {
         if text.len() > MAX_INPUT_BYTES {
-            return Err("Chart exceeds 2 MiB input limit".into());
+            return Err("Chart exceeds 20 MiB input limit".into());
         }
         let lines: Vec<Vec<&str>> = text
             .trim_start_matches('\u{feff}')
