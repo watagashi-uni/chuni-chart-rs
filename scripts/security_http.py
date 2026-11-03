@@ -162,6 +162,20 @@ with tempfile.TemporaryDirectory() as directory:
         cli_png = root / 'fast.png'
         subprocess.run([binary, 'render', str(chart), '--early-attack-only', '-o', str(cli_png)], check=True, stderr=subprocess.DEVNULL)
         assert fast_png == cli_png.read_bytes()
+        # The spacing-label switch applies independently to every image mode.
+        for endpoint, cli_flags in [('/api/render/1086_03', []),
+                                    ('/judge?name=1086_03', ['--judge']),
+                                    ('/fastattack/1086_03', ['--early-attack-only'])]:
+            separator = '&' if '?' in endpoint else '?'
+            full_tag, full_png = image(request(endpoint + separator + 'div=1'))
+            hidden_url = endpoint + separator + 'div=0'
+            hidden_tag, hidden_png = image(request(hidden_url, {'If-None-Match': full_tag}))
+            assert hidden_tag != full_tag and hidden_png != full_png
+            assert hidden_png[16:24] == full_png[16:24], 'Hiding labels changed image dimensions'
+            subprocess.run([binary, 'render', str(chart), *cli_flags, '--no-divisions', '-o', str(cli_png)],
+                           check=True, stderr=subprocess.DEVNULL)
+            assert hidden_png == cli_png.read_bytes(), 'HTTP/CLI spacing-label mode mismatch'
+            assert request(hidden_url, {'If-None-Match': hidden_tag})[0] == 304
         for suffix in ('&div=0', '&zoom=2', '&column=1', '&format=jpg', '&judge=1&easy=1'):
             status, headers, body = request(base + suffix, {'If-None-Match': tag})
             assert status == 200 and headers['ETag'] != tag, (suffix, status)
@@ -187,6 +201,7 @@ with tempfile.TemporaryDirectory() as directory:
             ('/config.json', 404), ('/charts/1086_03.c2s', 404),
             ('/1086_03.c2s', 404), ('/src/service.rs', 404), ('/Cargo.toml', 404),
             ('/inspect?name=1086_03', 404), ('/_worker', 404),
+            ('/', 404), ('/index.html', 404), ('/app.js', 404),
         ]
         if symlinks:
             cases += [('/api/render?name=escape', 404), ('/api/render?name=alias', 404)]
@@ -200,10 +215,11 @@ with tempfile.TemporaryDirectory() as directory:
                 assert secret.encode() not in body, path
         assert request('/api/render?name=' + 'x' * 3000)[0] == 414
         assert request(base, {'If-None-Match': 'x' * 9000})[0] == 431
-        status, headers, body = request('/')
-        assert status == 200 and b'<script src="/app.js">' in body
-        assert "script-src 'self'" in headers['Content-Security-Policy']
-        assert request('/app.js')[1]['Content-Type'].startswith('text/javascript')
+        status, headers, body = request('/healthz')
+        assert status == 200 and body == b'ok'
+        assert headers['Content-Type'].startswith('text/plain')
+        assert "default-src 'none'" in headers['Content-Security-Policy']
+        assert 'script-src' not in headers['Content-Security-Policy']
     # Persistent configured salt keeps validators stable across process restarts.
     with server(config) as (request, _):
         assert request('/api/render?name=1086_03', {'If-None-Match': tag})[0] == 304
@@ -213,6 +229,6 @@ with tempfile.TemporaryDirectory() as directory:
     with server(config) as (request, _):
         assert image(request('/api/render?name=1086_03', {'If-None-Match': tag}))[0] != tag
     print(json.dumps({'conditional_get': 'pass', 'option_validators': 'pass', 'persistent_salt': 'pass',
-                      'fastattack_api': 'pass', 'path_and_source_isolation': 'pass',
+                      'fastattack_api': 'pass', 'hide_divisions_all_modes': 'pass', 'path_and_source_isolation': 'pass',
                       'symlink_rejection': 'pass' if symlinks else 'skipped (Windows symlink privilege unavailable)',
-                      'wide_native_resolution_and_40mp_worker_budget': 'pass', 'input_20_mib_boundary': 'pass', 'request_limits': 'pass', 'security_headers': 'pass'}))
+                      'wide_native_resolution_and_40mp_worker_budget': 'pass', 'input_20_mib_boundary': 'pass', 'request_limits': 'pass', 'api_only_no_web_assets': 'pass', 'security_headers': 'pass'}))

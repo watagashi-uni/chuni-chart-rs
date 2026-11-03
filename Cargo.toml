@@ -1,6 +1,6 @@
 [package]
 name = "chuni-chart-rs"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Direct C2S chart image renderer and bounded HTTP service"
@@ -26,7 +26,7 @@ getrandom = "0.3"
 rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [build-dependencies]
 sha2 = "0.10"

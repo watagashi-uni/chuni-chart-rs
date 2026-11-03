@@ -12,7 +12,7 @@ use axum::{
     extract::{Path as UrlPath, Query, State, rejection::QueryRejection},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,8 @@ pub async fn run_worker(job: Job, timeout: Duration) -> Result<Vec<u8>> {
         .stderr(Stdio::null())
         .env_remove("ETAG_SALT")
         .kill_on_drop(true);
+    #[cfg(windows)]
+    crate::worker_limits::configure(&mut command);
     #[cfg(target_os = "linux")]
     unsafe {
         command.pre_exec(|| {
@@ -422,7 +424,12 @@ async fn response_policy(request: Request<axum::body::Body>, next: Next) -> Resp
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' blob:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        ),
+    );
     if !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
@@ -450,19 +457,6 @@ pub fn router_with_config(config: &Config) -> Result<Router> {
         timeout: Duration::from_secs(config.timeout_seconds),
     };
     Ok(Router::new()
-        .route(
-            "/",
-            get(|| async { Html(include_str!("../assets/index.html")) }),
-        )
-        .route(
-            "/app.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../assets/app.js"),
-                )
-            }),
-        )
         .route("/healthz", get(|| async { "ok" }))
         .route("/preview", get(preview))
         .route("/api/render", get(preview))

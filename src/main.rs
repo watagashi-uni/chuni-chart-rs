@@ -28,6 +28,7 @@ enum Command {
         /// Show only the early half of notes whose early ATTACK survives protection.
         #[arg(long)]
         early_attack_only: bool,
+        /// Hide note-spacing labels such as 1/16 and 1/24.
         #[arg(long)]
         no_divisions: bool,
         #[arg(long)]

@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #[cfg(windows)]
+pub(crate) fn configure(command: &mut tokio::process::Command) {
+    // Workers only communicate through pipes; Windows must not create a new
+    // console window for every render when the server has no attached console.
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+}
+
+#[cfg(windows)]
 pub(crate) fn attach(
     child: &tokio::process::Child,
 ) -> crate::Result<std::os::windows::io::OwnedHandle> {
@@ -40,4 +47,39 @@ pub(crate) fn attach(
         return Err("Cannot apply render worker limits".into());
     }
     Ok(job)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[tokio::test]
+    async fn worker_process_starts_without_a_console_window() {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        super::configure(&mut command);
+        command
+            .args([
+                "--exact",
+                "worker_limits::tests::console_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    #[ignore = "Runs in the child process launched by the console-window test"]
+    fn console_probe() {
+        // SAFETY: GetConsoleWindow takes no parameters and only queries the
+        // calling process. A null handle means there is no attached console.
+        assert!(unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null());
+    }
 }
