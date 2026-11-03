@@ -7,6 +7,7 @@ pub mod judgement;
 pub mod layout;
 mod queue;
 pub mod render;
+pub mod scroll;
 pub mod service;
 mod storage;
 mod worker_limits;

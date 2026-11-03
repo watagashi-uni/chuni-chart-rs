@@ -8,6 +8,78 @@ fn near(a: f64, b: f64) {
 }
 
 #[test]
+fn off_track_protection_uses_only_the_physical_keys_and_retains_source_geometry() {
+    let source = "BPM_DEF 120\n\
+        TAP 0 96 -4 6\nTAP 0 108 1 3\n\
+        TAP 0 96 14 6\nTAP 0 108 13 2\n\
+        TAP 0 100 -2 2\nCHR 0 100 16 4\n\
+        CHR 1 0 -16 48\nTAP 1 12 7 2\n";
+    let c = Chart::parse(source).unwrap();
+    assert!(chuni_chart_rs::judgement::supported(&c.notes));
+    let clipped: Vec<_> = c
+        .notes
+        .iter()
+        .filter_map(|n| {
+            let lanes = n.physical_lanes();
+            if lanes.is_empty() {
+                return None;
+            }
+            let mut n = n.clone();
+            n.lane = lanes.start as f64;
+            n.width = lanes.len() as f64;
+            Some(n)
+        })
+        .collect();
+    for easy in [false, true] {
+        let windows = protect(&c.notes, easy);
+        let expected = protect(&clipped, easy);
+        assert_eq!(windows.len(), 6);
+        assert_eq!(windows.len(), expected.len());
+        assert!(
+            windows
+                .iter()
+                .any(|w| w.note.lane == -16.0 && w.note.width == 48.0)
+        );
+        for (w, e) in windows.iter().zip(&expected) {
+            assert_eq!(w.note.time, e.note.time);
+            assert_eq!(w.note.kind, e.note.kind);
+            assert_eq!(w.early, e.early);
+            assert_eq!(w.late, e.late);
+            assert_eq!(w.miss, e.miss);
+            for l in 0..16 {
+                assert_eq!(bands(w, l, easy), bands(e, l, easy));
+            }
+            assert!(bands(w, 16, easy).is_empty());
+            assert!(bands(w, usize::MAX, easy).is_empty());
+        }
+        // The wide EXT keeps per-key notches; no off-track indexes are visited.
+        let wide = windows.iter().find(|w| w.note.width == 48.0).unwrap();
+        near(wide.late[7], -2.0 / 60.0);
+        near(wide.late[0], -if easy { 0.1 } else { 5.0 / 60.0 });
+    }
+}
+
+#[test]
+fn clipping_does_not_invent_critical_coverage_or_windows_for_off_track_art() {
+    let c =
+        Chart::parse("BPM_DEF 120\nTAP 0 96 -2 4\nCHR 0 96 0 2\nTAP 0 100 -8 4\nTAP 0 100 16 4")
+            .unwrap();
+    let ws = protect(&c.notes, false);
+    assert_eq!(ws.len(), 2);
+    let tap = ws.iter().find(|w| w.note.kind == "TAP").unwrap();
+    assert_eq!(tap.note.lane, -2.0);
+    assert_eq!(tap.note.width, 4.0);
+    assert!(!tap.note.critical()); // EXT covers only half the original TAP.
+    near(tap.early[0], 5.0 / 60.0);
+    near(tap.late[0], -5.0 / 60.0);
+    assert!(bands(tap, 2, false).is_empty());
+    assert!(bands(tap, 0, false).iter().any(|b| b.grade == "ATTACK"));
+    let art = Chart::parse("BPM_DEF 120\nTAP 0 96 -4 4\nCHR 0 108 16 4").unwrap();
+    assert!(chuni_chart_rs::judgement::supported(&art.notes));
+    assert!(protect(&art.notes, false).is_empty());
+}
+
+#[test]
 fn fifty_ms_pair_retains_fix_and_minimalizes_only_tap_and_touch() {
     for kind in ["TAP", "HLD_H", "SLD_H", "CHR", "FLK"] {
         for critical in [false, true] {
@@ -18,6 +90,7 @@ fn fifty_ms_pair_retains_fix_and_minimalizes_only_tap_and_touch() {
                 lane: 0.0,
                 width: 4.0,
                 critical,
+                slide_style: None,
             };
             let b = Note {
                 kind: "TAP".into(),
@@ -26,6 +99,7 @@ fn fifty_ms_pair_retains_fix_and_minimalizes_only_tap_and_touch() {
                 lane: 2.0,
                 width: 4.0,
                 critical: false,
+                slide_style: None,
             };
             let ws = protect(&[a, b], false);
             let a = &ws[0];
@@ -126,6 +200,7 @@ fn critical_coverage_uses_quantized_tick_and_existing_critical_heads() {
             lane: 0.0,
             width: 8.0,
             critical: true,
+            slide_style: None,
         },
         Note {
             kind: "TAP".into(),
@@ -134,6 +209,7 @@ fn critical_coverage_uses_quantized_tick_and_existing_critical_heads() {
             lane: 2.0,
             width: 4.0,
             critical: false,
+            slide_style: None,
         },
         Note {
             kind: "TAP".into(),
@@ -142,6 +218,7 @@ fn critical_coverage_uses_quantized_tick_and_existing_critical_heads() {
             lane: 2.0,
             width: 4.0,
             critical: false,
+            slide_style: None,
         },
         Note {
             kind: "TAP".into(),
@@ -150,6 +227,7 @@ fn critical_coverage_uses_quantized_tick_and_existing_critical_heads() {
             lane: 6.0,
             width: 4.0,
             critical: false,
+            slide_style: None,
         },
         Note {
             kind: "HLD_T".into(),
@@ -158,6 +236,7 @@ fn critical_coverage_uses_quantized_tick_and_existing_critical_heads() {
             lane: 2.0,
             width: 4.0,
             critical: false,
+            slide_style: None,
         },
     ];
     mark_critical_notes(&mut notes);

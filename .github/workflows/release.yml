@@ -31,6 +31,10 @@ jobs:
           assert [p.name for p in files] == ['chuni-chart-rs-linux-x64.tar.gz', 'chuni-chart-rs-windows-x64.zip']
           Path('dist/SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.name + '\n' for p in files))
           PY
+      - name: Extract current version notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/release_notes.py "$RELEASE_TAG" > release-notes.md
       - name: Publish tested binaries
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,4 +44,4 @@ jobs:
           dist/chuni-chart-rs-linux-x64.tar.gz
           dist/chuni-chart-rs-windows-x64.zip
           dist/SHA256SUMS
-          --verify-tag --title "$RELEASE_TAG" --notes-file CHANGELOG.md
+          --verify-tag --title "$RELEASE_TAG" --notes-file release-notes.md

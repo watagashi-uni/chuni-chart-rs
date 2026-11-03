@@ -557,7 +557,22 @@ fn off_lane_art_is_clipped_without_changing_layout_or_timing() {
             }
         }
     }
-    assert!(!chuni_chart_rs::judgement::supported(&chart.notes));
-    assert!(protect(&chart.notes, false).is_empty());
-    assert!(render::render(&chart, &Options { judge: true, ..o }).is_err());
+    assert!(chuni_chart_rs::judgement::supported(&chart.notes));
+    let windows = protect(&chart.notes, false);
+    assert_eq!(windows.len(), 1); // TAP intersects the keys; SLIDE head is off-track.
+    assert_eq!(windows[0].note.lane, -2.0);
+    assert_eq!(windows[0].note.physical_lanes(), 0..2);
+    for early_attack_only in [false, true] {
+        assert!(
+            render::render(
+                &chart,
+                &Options {
+                    judge: true,
+                    early_attack_only,
+                    ..o.clone()
+                }
+            )
+            .is_ok()
+        );
+    }
 }

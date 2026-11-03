@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use crate::{
     MAX_OUTPUT_BYTES, Result,
-    chart::{Chart, mark_critical_notes},
+    chart::{Chart, SlideStyle, mark_critical_notes},
     judgement::{Window, bands, protect_with_resolution},
 };
 use serde::{Deserialize, Serialize};
@@ -70,7 +70,7 @@ fn sheet(c: &Chart, o: &Options) -> Result<(crate::layout::Layout, f64, f64)> {
         return Err("Unsupported output format".into());
     }
     if o.shows_judgements() && !crate::judgement::supported(&c.notes) {
-        return Err("Off-lane charts currently support ordinary previews only".into());
+        return Err("Invalid ground-note geometry or timing for judgements".into());
     }
     let mut layout = crate::layout::layout(c, o.zoom);
     if let Some(column) = o.column {
@@ -470,29 +470,46 @@ fn slide_units(c: &Chart) -> Vec<(f64, f64)> {
         "SXD" => 2,
         _ => 3,
     });
-    let key = |t: f64, x: f64, w: f64| (t.to_bits(), x.to_bits(), w.to_bits());
+    let key = |t: f64, x: f64, w: f64, style: Option<SlideStyle>| {
+        (t.to_bits(), x.to_bits(), w.to_bits(), style)
+    };
     let mut begins: HashMap<_, VecDeque<usize>> = HashMap::new();
     let mut ends = HashSet::new();
     for &i in &indices {
         let n = &c.longs[i];
         begins
-            .entry(key(n.head.tick, n.head.lane, n.head.width))
+            .entry(key(
+                n.head.tick,
+                n.head.lane,
+                n.head.width,
+                n.head.slide_style,
+            ))
             .or_default()
             .push_back(i);
-        ends.insert(key(n.end_tick, n.end_lane, n.end_width));
+        ends.insert(key(n.end_tick, n.end_lane, n.end_width, n.head.slide_style));
     }
     let mut heads: Vec<_> = indices
         .iter()
         .copied()
         .filter(|&i| {
             let n = &c.longs[i];
-            !ends.contains(&key(n.head.tick, n.head.lane, n.head.width))
+            !ends.contains(&key(
+                n.head.tick,
+                n.head.lane,
+                n.head.width,
+                n.head.slide_style,
+            ))
         })
         .collect();
     for &i in &indices {
         let n = &c.longs[i];
         if n.head.kind.ends_with('D')
-            && let Some(next) = begins.get(&key(n.end_tick, n.end_lane, n.end_width))
+            && let Some(next) = begins.get(&key(
+                n.end_tick,
+                n.end_lane,
+                n.end_width,
+                n.head.slide_style,
+            ))
         {
             for &j in next {
                 if !heads.contains(&j) {
@@ -514,7 +531,12 @@ fn slide_units(c: &Chart) -> Vec<(f64, f64)> {
             chain.push(i);
             let n = &c.longs[i];
             current = begins
-                .get_mut(&key(n.end_tick, n.end_lane, n.end_width))
+                .get_mut(&key(
+                    n.end_tick,
+                    n.end_lane,
+                    n.end_width,
+                    n.head.slide_style,
+                ))
                 .and_then(VecDeque::pop_front);
             if current.is_some_and(|i| head_set.contains(&i)) {
                 break;
@@ -627,7 +649,8 @@ fn long_path(
     unit: (f64, f64),
 ) {
     let air = n.head.kind.starts_with('A');
-    let hold = matches!(n.head.kind.as_str(), "HLD" | "HXD");
+    let style = n.head.slide_style.unwrap_or_default();
+    let hold = matches!(n.head.kind.as_str(), "HLD" | "HXD") || (!air && style == SlideStyle::Hold);
     let polygon = clip_y(
         vec![
             (x + n.head.lane * 10.0, y(n.head.time)),
@@ -647,8 +670,18 @@ fn long_path(
             if n.head.kind != "ALD" {
                 v.path(&polygon, rgba(74, 222, 128, 13), None, true);
             }
+        } else if style == SlideStyle::Green {
+            // 2.40 uses a green body and a separate green center texture.
+            v.blend = tiny_skia::BlendMode::Lighten;
+            v.path(&polygon, rgba(74, 222, 128, 153), None, true);
+            v.blend = tiny_skia::BlendMode::SourceOver;
         } else {
             v.gradient(&polygon, y(n.head.time), y(n.end_time), unit.0, unit.1);
+        }
+        // 2.50 JointSlide drawing (0x00C2E550, branch 0x00C2F6E4): NCL
+        // skips only the center mesh. Body and endpoint resources are shared.
+        if !air && style == SlideStyle::NoCenterLine {
+            return;
         }
         let middle = clip_y(
             vec![
@@ -679,6 +712,8 @@ fn long_path(
             &middle,
             if air {
                 air_color(&n.head.kind, &n.color)
+            } else if style == SlideStyle::Green {
+                rgba(134, 239, 172, 255)
             } else {
                 rgba(0, 255, 255, 255)
             },
@@ -812,8 +847,8 @@ fn draw_judgements(
         if w.note.time + 0.11 < start || w.note.time - 0.11 > end {
             continue;
         }
-        let first = w.note.lane as usize;
-        let last = (w.note.lane + w.note.width) as usize;
+        let range = w.note.physical_lanes();
+        let (first, last) = (range.start, range.end);
         let mut all: Vec<_> = (first..last).map(|l| bands(w, l, options.easy)).collect();
         if options.early_attack_only {
             // Protection used the entire chart. Only the resulting display is
@@ -945,6 +980,39 @@ fn draw_judgements(
     v.union_rects(&thin_attacks, rgba(57, 255, 136, 255));
 }
 
+// Presentation rule: HOLD head bands stop at the tail. Apply this after pair
+// protection so a short hold cannot enlarge a neighboring note's window.
+// The numerical judgement API and inspect retain the EXE's internal windows.
+fn cap_hold_windows(c: &Chart, windows: &mut [Window]) {
+    use std::collections::HashMap;
+    let key =
+        |ext, n: &crate::chart::Note| (ext, n.tick.to_bits(), n.lane.to_bits(), n.width.to_bits());
+    let mut ends: HashMap<_, f64> = HashMap::new();
+    for n in &c.longs {
+        let ext = match n.head.kind.as_str() {
+            "HLD" => false,
+            "HXD" => true,
+            _ => continue,
+        };
+        // Coincident heads are deduplicated by the parser; retain the union
+        // of their displayed windows when their hold durations differ.
+        ends.entry(key(ext, &n.head))
+            .and_modify(|end| *end = end.max(n.end_time))
+            .or_insert(n.end_time);
+    }
+    for w in windows {
+        if matches!(w.note.kind.as_str(), "HLD_H" | "CHR")
+            && let Some(end) = ends.get(&key(w.note.kind == "CHR", &w.note))
+        {
+            let late = -(end - w.note.time).max(0.0);
+            for lane in &mut w.late {
+                *lane = lane.max(late);
+            }
+            w.miss = w.miss.max(late);
+        }
+    }
+}
+
 pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
     let d = dimensions(c, o)?;
     let (layout, w, h) = sheet(c, o)?;
@@ -966,7 +1034,9 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
     };
     v.pix.fill(tiny_skia::Color::from_rgba8(107, 114, 128, 255));
     let windows = if o.shows_judgements() {
-        protect_with_resolution(&notes, o.easy, c.resolution)
+        let mut windows = protect_with_resolution(&notes, o.easy, c.resolution);
+        cap_hold_windows(c, &mut windows);
+        windows
     } else {
         Vec::new()
     };

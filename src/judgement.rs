@@ -34,11 +34,13 @@ pub fn supported(input: &[Note]) -> bool {
         n.time.is_finite()
             && n.tick.is_finite()
             && n.tick >= 0.0
-            && n.lane >= 0.0
+            && n.lane.is_finite()
+            && n.lane >= -128.0
             && n.lane.fract() == 0.0
+            && n.width.is_finite()
             && n.width > 0.0
             && n.width.fract() == 0.0
-            && n.lane + n.width <= 16.0
+            && n.lane + n.width <= 144.0
     })
 }
 
@@ -51,6 +53,8 @@ pub fn protect(input: &[Note], easy: bool) -> Vec<Window> {
 
 /// Apply the default TAP/EXT/FLICK.TAP profiles and pair protection.
 /// AIR, MINE, sustained judgements and FLICK.SLASH are outside this model.
+/// Off-track notes use only their intersection with the 16 physical keys;
+/// wholly off-track art contributes no judgement window or pair protection.
 pub fn protect_with_resolution(input: &[Note], easy: bool, resolution: f64) -> Vec<Window> {
     if !supported(input) || !resolution.is_finite() || resolution <= 0.0 {
         return Vec::new();
@@ -60,6 +64,7 @@ pub fn protect_with_resolution(input: &[Note], easy: bool, resolution: f64) -> V
     let mut ws: Vec<_> = notes
         .into_iter()
         .filter(Note::ground)
+        .filter(|n| !n.physical_lanes().is_empty())
         .map(|note| {
             let max = outer(&note, easy);
             Window {
@@ -90,8 +95,10 @@ pub fn protect_with_resolution(input: &[Note], easy: bool, resolution: f64) -> V
             {
                 continue;
             }
-            let first = a.note.lane.max(b.note.lane) as usize;
-            let last = (a.note.lane + a.note.width).min(b.note.lane + b.note.width) as usize;
+            let al = a.note.physical_lanes();
+            let bl = b.note.physical_lanes();
+            let first = al.start.max(bl.start);
+            let last = al.end.min(bl.end);
             let distance = (dt / 2.0).max(FIX);
             for lane in first..last {
                 a.late[lane] = a.late[lane].max(-distance);
@@ -102,8 +109,8 @@ pub fn protect_with_resolution(input: &[Note], easy: bool, resolution: f64) -> V
     // 0x0119DF70: MINIMALIZE runs after all pairs. TAP and FLICK.TAP propagate
     // the tightest side across the note; EXT retains per-lane notches.
     for w in &mut ws {
-        let first = w.note.lane as usize;
-        let last = (w.note.lane + w.note.width) as usize;
+        let range = w.note.physical_lanes();
+        let (first, last) = (range.start, range.end);
         if !w.note.critical() {
             let early = w.early[first..last]
                 .iter()
@@ -122,6 +129,9 @@ pub fn protect_with_resolution(input: &[Note], easy: bool, resolution: f64) -> V
 }
 
 pub fn bands(w: &Window, l: usize, easy: bool) -> Vec<Band> {
+    if !w.note.physical_lanes().contains(&l) {
+        return Vec::new();
+    }
     let attack = outer(&w.note, easy);
     let lo = -attack.min(w.early[l]);
     let hi = -(-attack).max(w.late[l]).max(w.miss);

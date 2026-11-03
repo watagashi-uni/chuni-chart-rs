@@ -13,6 +13,7 @@ fn main() {
         "src/judgement.rs",
         "src/layout.rs",
         "src/render.rs",
+        "src/scroll.rs",
         "assets/DejaVuSans.ttf",
     ] {
         println!("cargo:rerun-if-changed={path}");

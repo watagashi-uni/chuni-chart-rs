@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "chuni-chart-rs"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "axum",
  "chrono",

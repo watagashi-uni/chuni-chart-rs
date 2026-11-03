@@ -1,7 +1,35 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+pub use crate::scroll::{Scroll, ScrollArea, ScrollProfile};
 use crate::{MAX_EVENTS, MAX_INPUT_BYTES, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+
+/// C2S field 8 on SLD/SLC/SXD/SXC, separate from the EX head flag.
+/// Recognizes 2.50 SLD/NCL and legacy 2.40 HLD/GRN for chart compatibility.
+/// Unknown values use SLD. Styles do not change the note's judgement kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SlideStyle {
+    #[default]
+    #[serde(rename = "SLD")]
+    Slide,
+    #[serde(rename = "NCL")]
+    NoCenterLine,
+    #[serde(rename = "HLD")]
+    Hold,
+    #[serde(rename = "GRN")]
+    Green,
+}
+
+impl SlideStyle {
+    fn parse(value: Option<&&str>) -> Self {
+        match value.copied() {
+            Some("NCL") => Self::NoCenterLine,
+            Some("HLD") => Self::Hold,
+            Some("GRN") => Self::Green,
+            _ => Self::Slide,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Note {
@@ -13,8 +41,15 @@ pub struct Note {
     pub width: f64,
     #[serde(default)]
     pub critical: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slide_style: Option<SlideStyle>,
 }
 impl Note {
+    /// Physical keys touched by an integral ground note. Keep source geometry
+    /// intact: off-track art is clipped only at the drawing/keyboard boundary.
+    pub fn physical_lanes(&self) -> std::ops::Range<usize> {
+        self.lane.clamp(0.0, 16.0) as usize..(self.lane + self.width).clamp(0.0, 16.0) as usize
+    }
     pub fn ground(&self) -> bool {
         matches!(
             self.kind.as_str(),
@@ -95,15 +130,6 @@ pub struct Measure {
     pub id: usize,
 }
 #[derive(Clone, Debug, Serialize)]
-pub struct Scroll {
-    pub time: f64,
-    pub end_time: f64,
-    pub lane: f64,
-    pub width: f64,
-    pub velocity: f64,
-    pub global: bool,
-}
-#[derive(Clone, Debug, Serialize)]
 pub struct Chart {
     pub resolution: f64,
     pub tempos: Vec<Tempo>,
@@ -112,9 +138,12 @@ pub struct Chart {
     pub beats: Vec<Beat>,
     pub measures: Vec<Measure>,
     pub scrolls: Vec<Scroll>,
+    /// Source speed programs and their note-selection areas, kept independently.
+    pub scroll_profiles: Vec<ScrollProfile>,
+    pub scroll_areas: Vec<ScrollArea>,
     pub duration: f64,
 }
-fn num(parts: &[&str], i: usize) -> Result<f64> {
+pub(crate) fn num(parts: &[&str], i: usize) -> Result<f64> {
     let n: f64 = parts
         .get(i)
         .ok_or("Missing numeric field")?
@@ -125,7 +154,7 @@ fn num(parts: &[&str], i: usize) -> Result<f64> {
     }
     Ok(n)
 }
-fn tick(p: &[&str], resolution: f64) -> Result<f64> {
+pub(crate) fn tick(p: &[&str], resolution: f64) -> Result<f64> {
     let t = num(p, 1)? * resolution + num(p, 2)?;
     if !(0.0..=10_000_000.0).contains(&t) {
         return Err("Tick outside supported range".into());
@@ -134,7 +163,7 @@ fn tick(p: &[&str], resolution: f64) -> Result<f64> {
 }
 // Some charts deliberately position art outside the 16 physical lanes.
 // Retain bounded coordinates for interpolation; the renderer clips the result.
-fn geometry(lane: f64, width: f64) -> Result<()> {
+pub(crate) fn geometry(lane: f64, width: f64) -> Result<()> {
     if !lane.is_finite()
         || !width.is_finite()
         || lane < -128.0
@@ -153,6 +182,7 @@ fn base(p: &[&str], resolution: f64) -> Result<Note> {
         lane: num(p, 3)?,
         width: num(p, 4)?,
         critical: false,
+        slide_style: None,
     };
     geometry(n.lane, n.width)?;
     Ok(n)
@@ -232,6 +262,8 @@ impl Chart {
             beats: Vec::new(),
             measures: Vec::new(),
             scrolls: Vec::new(),
+            scroll_profiles: Vec::new(),
+            scroll_areas: Vec::new(),
             duration: 0.0,
         };
         for (line, p) in lines.iter().enumerate() {
@@ -241,8 +273,11 @@ impl Chart {
                     | "ADL" => c.notes.push(base(p, resolution)?),
                     "HLD" | "HXD" | "AHD" | "AHX" | "SLD" | "SLC" | "SXD" | "SXC" | "ASC"
                     | "ASD" | "ALD" => {
-                        let head = base(p, resolution)?;
+                        let mut head = base(p, resolution)?;
                         let k = p[0];
+                        if matches!(k, "SLD" | "SLC" | "SXD" | "SXC") {
+                            head.slide_style = Some(SlideStyle::parse(p.get(8)));
+                        }
                         let hold = matches!(k, "HLD" | "HXD" | "AHD" | "AHX");
                         let air_hold = matches!(k, "AHD" | "AHX");
                         let air_path = matches!(k, "ASC" | "ASD" | "ALD");
@@ -323,6 +358,7 @@ impl Chart {
                                             lane: head.lane + (end_lane - head.lane) * r,
                                             width: head.width + (end_width - head.width) * r,
                                             critical: false,
+                                            slide_style: None,
                                         });
                                     }
                                 }
@@ -367,10 +403,13 @@ impl Chart {
             .collect();
         let ends: HashSet<_> = slides
             .iter()
-            .map(|s| key(s.end_tick, s.end_lane, s.end_width))
+            .map(|s| (key(s.end_tick, s.end_lane, s.end_width), s.head.slide_style))
             .collect();
         for s in slides {
-            if !ends.contains(&key(s.head.tick, s.head.lane, s.head.width)) {
+            if !ends.contains(&(
+                key(s.head.tick, s.head.lane, s.head.width),
+                s.head.slide_style,
+            )) {
                 let mut h = s.head.clone();
                 h.kind = if h.kind.starts_with("SX") {
                     "CHR"
@@ -386,7 +425,7 @@ impl Chart {
         }
         let mut seen = HashSet::new();
         c.notes
-            .retain(|n| seen.insert((n.kind.clone(), key(n.tick, n.lane, n.width))));
+            .retain(|n| seen.insert((n.kind.clone(), key(n.tick, n.lane, n.width), n.slide_style)));
         c.notes.sort_by(|a, b| a.tick.total_cmp(&b.tick));
         let times: Vec<_> = c.notes.iter().map(|n| c.seconds_at(n.tick)).collect();
         for (n, t) in c.notes.iter_mut().zip(times) {
@@ -405,95 +444,7 @@ impl Chart {
             n.head.time = start;
             n.end_time = end;
         }
-        let mut scroll_end: f64 = 0.0;
-        let mut lists: std::collections::HashMap<u64, Vec<(f64, f64, f64)>> =
-            std::collections::HashMap::new();
-        for p in &lines {
-            if matches!(p[0], "SFL" | "SLP") {
-                let start = tick(p, resolution)?;
-                let duration = num(p, 3)?;
-                let velocity = num(p, 4)?;
-                if duration < 0.0 || duration > resolution * 100_000.0 || velocity.abs() > 100_000.0
-                {
-                    return Err("Invalid scroll event".into());
-                }
-                let end = start + duration;
-                if p[0] == "SFL" {
-                    scroll_end = scroll_end.max(end);
-                    let mut at = start;
-                    while at < end {
-                        let stop = ((at / resolution).floor() + 1.0) * resolution;
-                        let stop = stop.min(end);
-                        c.scrolls.push(Scroll {
-                            time: c.seconds_at(at),
-                            end_time: c.seconds_at(stop),
-                            lane: 0.0,
-                            width: 16.0,
-                            velocity,
-                            global: true,
-                        });
-                        if c.scrolls.len() > MAX_EVENTS {
-                            return Err("Too many scroll events".into());
-                        }
-                        at = stop;
-                    }
-                } else {
-                    lists
-                        .entry(num(p, 5)?.to_bits())
-                        .or_default()
-                        .push((start, end, velocity));
-                }
-            }
-        }
-        for p in &lines {
-            if p[0] == "SLA" {
-                let n = base(p, resolution)?;
-                let duration = num(p, 5)?;
-                if duration < 0.0 {
-                    return Err("Negative scroll area duration".into());
-                }
-                let end = n.tick + duration;
-                if let Some(list) = lists.get(&num(p, 6)?.to_bits()) {
-                    let mut max: f64 = 0.0;
-                    for &(a, b, v) in list {
-                        max = max.max(b);
-                        let b = b.min(end);
-                        if b > a {
-                            c.scrolls.push(Scroll {
-                                time: c.seconds_at(a),
-                                end_time: c.seconds_at(b),
-                                lane: n.lane,
-                                width: n.width,
-                                velocity: v,
-                                global: false,
-                            });
-                        }
-                        if c.scrolls.len() > MAX_EVENTS {
-                            return Err("Too many scroll events".into());
-                        }
-                    }
-                    if max < end {
-                        c.scrolls.push(Scroll {
-                            time: c.seconds_at(max),
-                            end_time: c.seconds_at(end),
-                            lane: n.lane,
-                            width: n.width,
-                            velocity: 1.0,
-                            global: false,
-                        });
-                    }
-                }
-            }
-        }
-        if c.notes.len() + c.longs.len() + c.scrolls.len() > MAX_EVENTS {
-            return Err("Too many chart events".into());
-        }
-        if c.scrolls
-            .iter()
-            .any(|s| !s.end_time.is_finite() || s.end_time > 600.0)
-        {
-            return Err("Scroll duration exceeds 600 seconds".into());
-        }
+        let scroll_end = crate::scroll::parse(&mut c, &lines)?;
         let mut end_tick = c
             .notes
             .iter()

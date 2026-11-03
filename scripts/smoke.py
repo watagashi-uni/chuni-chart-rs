@@ -17,6 +17,7 @@ binary = str(Path(sys.argv[1] if len(sys.argv) > 1 else 'target/release/chuni-ch
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
     (root / 'demo.c2s').write_text((Path(__file__).resolve().parents[1] / 'tests/fixtures/demo.c2s').read_text())
+    (root / 'styles.c2s').write_text((Path(__file__).resolve().parents[1] / 'tests/fixtures/scroll-slide-styles.c2s').read_text())
     (root / 'overflow.c2s').write_text('BPM_DEF 120\nTAP 0 96 -2 4\nSLD 0 0 -16 4 384 28 4')
     (root / 'bad.c2s').write_text('BPM_DEF NaN\nTAP 0 0 0 1')
     (root / 'large.c2s').write_bytes(b' ' * (20 * 1024 * 1024 + 1))
@@ -60,7 +61,20 @@ with tempfile.TemporaryDirectory() as directory:
         assert status == 200 and body != normal, 'Early mode was ignored'
         status, body = request('/preview?name=overflow')
         assert status == 200 and body[:8] == b'\x89PNG\r\n\x1a\n'
-        assert request('/judge?name=overflow')[0] == 422
+        for path, cli_mode in [('/judge?name=overflow', '--judge'), ('/fastattack/overflow', '--early-attack-only')]:
+            png = root / 'overflow.png'
+            subprocess.run([binary, 'render', str(root / 'overflow.c2s'), cli_mode, '-o', str(png)], check=True, stderr=subprocess.DEVNULL)
+            status, body, headers = request(path, include_headers=True)
+            assert status == 200 and body == png.read_bytes(), ('off-lane HTTP/CLI mismatch', status)
+            assert request(path, {'If-None-Match': headers['ETag']}) == (304, b'')
+        inspected = json.loads(subprocess.check_output([binary, 'inspect', str(root / 'overflow.c2s')]))
+        assert inspected['judgement_supported']
+        assert len(inspected['windows']) == 1 and len(inspected['windows'][0]['lanes']) == 2
+        for path, cli_mode in [('/preview?name=styles', []), ('/judge?name=styles', ['--judge']), ('/fastattack/styles', ['--early-attack-only'])]:
+            png = root / 'styles.png'
+            subprocess.run([binary, 'render', str(root / 'styles.c2s'), *cli_mode, '-o', str(png)], check=True, stderr=subprocess.DEVNULL)
+            status, body = request(path)
+            assert status == 200 and body == png.read_bytes(), ('SLP/SLIDE style HTTP/CLI mismatch', path, status)
         status, _, cache_headers = request('/preview?name=demo', include_headers=True)
         assert status == 200 and cache_headers['ETag']
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -107,7 +121,7 @@ with tempfile.TemporaryDirectory() as directory:
             for task in Path(f'/proc/{process.pid}/task').iterdir():
                 children.extend((task / 'children').read_text().split())
             assert not children, children
-        print(json.dumps({'http_images': 'pass', 'early_attack_mode': 'pass', 'malformed_input': 'pass', 'oversize_input': 'pass', 'concurrent_requests_wait': 'pass', 'conditional_hit_while_busy': 'pass' if timeout_checked else 'skipped (requires Linux /proc)', 'timeout_and_recovery': 'pass' if timeout_checked else 'skipped (requires Linux /proc)', 'child_reaping': 'pass' if sys.platform == 'linux' else 'skipped'}))
+        print(json.dumps({'http_images': 'pass', 'early_attack_mode': 'pass', 'off_lane_judgements': 'pass', 'scroll_slide_styles': 'pass', 'malformed_input': 'pass', 'oversize_input': 'pass', 'concurrent_requests_wait': 'pass', 'conditional_hit_while_busy': 'pass' if timeout_checked else 'skipped (requires Linux /proc)', 'timeout_and_recovery': 'pass' if timeout_checked else 'skipped (requires Linux /proc)', 'child_reaping': 'pass' if sys.platform == 'linux' else 'skipped'}))
     finally:
         process.terminate()
         process.wait(timeout=10)

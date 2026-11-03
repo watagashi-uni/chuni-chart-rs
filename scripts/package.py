@@ -18,6 +18,8 @@ if os.getenv('GITHUB_REF_TYPE') == 'tag':
 assert args.binary.is_file(), 'Compiled binary missing'
 files = {name: root / name for name in ('README.md', 'LICENSE', 'NOTICE', 'SECURITY.md', 'CHANGELOG.md', 'config.example.json')}
 files['FONT-LICENSE'] = root / 'assets/FONT-LICENSE'
+for name in ('docs/c2s-scroll-slide.md', 'docs/hold-head-and-tail.md'):
+    files[name] = root / name
 files['chuni-chart-rs' + ('.exe' if args.platform == 'windows' else '')] = args.binary
 if args.platform == 'linux':
     files['deploy/chuni-chart.service'] = root / 'deploy/chuni-chart.service'
