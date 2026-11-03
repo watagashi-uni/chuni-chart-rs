@@ -2,6 +2,7 @@
 use chuni_chart_rs::{
     Result,
     chart::Chart,
+    config::Config,
     render::{self, Options},
     service::{self, Job},
 };
@@ -24,6 +25,11 @@ enum Command {
         output: PathBuf,
         #[arg(long)]
         judge: bool,
+        /// Show only the early half of notes whose early ATTACK survives protection.
+        #[arg(long)]
+        early_attack_only: bool,
+        #[arg(long)]
+        no_divisions: bool,
         #[arg(long)]
         easy: bool,
         #[arg(long, default_value_t = 1.0)]
@@ -36,13 +42,21 @@ enum Command {
         #[arg(long)]
         easy: bool,
     },
+    /// Start the image API; reads config.json when present.
     Serve {
-        #[arg(long, env = "CHART_DIR", default_value = "charts")]
-        chart_dir: PathBuf,
-        #[arg(long, env = "LISTEN", default_value = "127.0.0.1:3000")]
-        listen: String,
-        #[arg(long, default_value_t = 15)]
-        timeout: u64,
+        #[arg(long, env = "CHUNI_CHART_CONFIG")]
+        config: Option<PathBuf>,
+        #[arg(long, env = "CHART_DIR")]
+        chart_dir: Option<PathBuf>,
+        #[arg(long, env = "LISTEN")]
+        listen: Option<String>,
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Create a configuration with a random persistent ETag salt; never overwrite.
+    InitConfig {
+        #[arg(short, long, default_value = "config.json")]
+        output: PathBuf,
     },
     #[command(name = "_worker", hide = true)]
     Worker,
@@ -53,6 +67,8 @@ fn run() -> Result<()> {
             input,
             output,
             judge,
+            early_attack_only,
+            no_divisions,
             easy,
             zoom,
             column,
@@ -65,6 +81,8 @@ fn run() -> Result<()> {
                 .to_ascii_lowercase();
             let options = Options {
                 judge,
+                early_attack_only,
+                divisions: !no_divisions,
                 easy,
                 format,
                 zoom,
@@ -84,7 +102,8 @@ fn run() -> Result<()> {
         }
         Command::Inspect { input, easy } => {
             let c = Chart::parse(&service::read_chart(&input)?)?;
-            let windows = chuni_chart_rs::judgement::protect(&c.notes, easy);
+            let windows =
+                chuni_chart_rs::judgement::protect_with_resolution(&c.notes, easy, c.resolution);
             let ws:Vec<_>=windows.iter().map(|w|serde_json::json!({"note":w.note,"lanes":(w.note.lane as usize..(w.note.lane+w.note.width)as usize).map(|l|chuni_chart_rs::judgement::bands(w,l,easy)).collect::<Vec<_>>()})).collect();
             serde_json::to_writer(
                 std::io::stdout(),
@@ -93,15 +112,41 @@ fn run() -> Result<()> {
             .map_err(|_| "Cannot write inspection".into())
         }
         Command::Serve {
+            config,
             chart_dir,
             listen,
             timeout,
-        } => tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|_| "Runtime initialization failed")?
-            .block_on(service::serve(chart_dir, &listen, timeout)),
+        } => {
+            let mut settings = Config::load(config.as_deref())?;
+            if let Some(root) = chart_dir {
+                settings.chart_dir = root;
+            }
+            if let Some(listen) = listen {
+                settings.listen = listen;
+            }
+            if let Some(seconds) = timeout {
+                settings.timeout_seconds = seconds;
+            }
+            match std::env::var("ETAG_SALT") {
+                Ok(salt) => settings.etag_salt = Some(salt),
+                Err(std::env::VarError::NotPresent) => {}
+                Err(_) => return Err("ETAG_SALT must be UTF-8".into()),
+            }
+            settings.validate()?;
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|_| "Runtime initialization failed")?
+                .block_on(service::serve_config(settings))
+        }
+        Command::InitConfig { output } => {
+            Config::initialize(&output)?;
+            eprintln!(
+                "Configuration created. Set chart_dir to the directory containing C2S files."
+            );
+            Ok(())
+        }
         Command::Worker => {
             let mut input = Vec::new();
             std::io::stdin()

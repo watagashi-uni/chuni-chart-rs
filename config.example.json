@@ -1,0 +1,6 @@
+{
+  "chart_dir": "charts",
+  "listen": "127.0.0.1:3000",
+  "timeout_seconds": 15,
+  "etag_salt": null
+}

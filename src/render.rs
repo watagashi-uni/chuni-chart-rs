@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use crate::{
     MAX_OUTPUT_BYTES, Result,
-    chart::{Chart, mark_critical_heads},
-    judgement::{bands, protect},
+    chart::{Chart, mark_critical_notes},
+    judgement::{Window, bands, protect_with_resolution},
 };
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -11,7 +11,10 @@ use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
     pub judge: bool,
+    /// Show only pre-note bands for notes with surviving early ATTACK. Implies judge.
+    pub early_attack_only: bool,
     pub easy: bool,
+    pub divisions: bool,
     pub format: String,
     pub zoom: f64,
     pub column: Option<usize>,
@@ -20,11 +23,18 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             judge: false,
+            early_attack_only: false,
             easy: false,
+            divisions: true,
             format: "png".into(),
             zoom: 1.0,
             column: None,
         }
+    }
+}
+impl Options {
+    fn shows_judgements(&self) -> bool {
+        self.judge || self.early_attack_only
     }
 }
 #[derive(Debug, Serialize)]
@@ -43,7 +53,7 @@ fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
 }
 fn grade(g: &str) -> Color {
     match g {
-        "JC" => rgba(255, 225, 94, 101),
+        "JC" => rgba(255, 225, 94, 64),
         "JUSTICE" => rgba(255, 143, 72, 85),
         "ATTACK" => rgba(82, 218, 139, 69),
         _ => rgba(119, 186, 255, 68),
@@ -56,7 +66,7 @@ fn sheet(c: &Chart, o: &Options) -> Result<(crate::layout::Layout, f64, f64)> {
     if !matches!(o.format.as_str(), "png" | "jpg" | "jpeg") {
         return Err("Unsupported output format".into());
     }
-    if o.judge && !crate::judgement::supported(&c.notes) {
+    if o.shows_judgements() && !crate::judgement::supported(&c.notes) {
         return Err("Off-lane charts currently support ordinary previews only".into());
     }
     let mut layout = crate::layout::layout(c, o.zoom);
@@ -74,7 +84,7 @@ fn sheet(c: &Chart, o: &Options) -> Result<(crate::layout::Layout, f64, f64)> {
         .fold(0.0, f64::max)
         + 88.0
         + FOOT
-        + if o.judge { 38.0 } else { 0.0 };
+        + if o.shows_judgements() { 38.0 } else { 0.0 };
     Ok((layout, w, h))
 }
 pub fn dimensions(c: &Chart, o: &Options) -> Result<Dimensions> {
@@ -98,57 +108,116 @@ struct Canvas {
     blend: tiny_skia::BlendMode,
     clip_x: Option<(f64, f64)>,
 }
-impl Canvas {
-    // Omit strokes inside narrow ATTACK rectangles without allocating image masks.
-    fn outline_segment(&mut self, a: (f64, f64), b: (f64, f64), gaps: &[[f64; 4]]) {
-        let delta = [b.0 - a.0, b.1 - a.1];
-        if delta == [0.0, 0.0] {
+// Store the strongest bevel sample at each pixel, rather than compositing
+// shadows for every note. Coincident edges cannot keep getting darker/brighter.
+struct Relief {
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+    scale: f64,
+    shades: Vec<i16>,
+}
+impl Relief {
+    fn new(v: &Canvas, left: f64, right: f64, top: f64, bottom: f64) -> Self {
+        let scale = v.scale as f64;
+        let left = (left * scale).floor().max(0.0) as usize;
+        let right = ((right * scale).ceil() as usize).min(v.pix.width() as usize);
+        let top = (top * scale).floor().max(0.0) as usize;
+        let bottom = ((bottom * scale).ceil() as usize).min(v.pix.height() as usize);
+        let width = right.saturating_sub(left);
+        let height = bottom.saturating_sub(top);
+        Self {
+            left,
+            top,
+            width,
+            height,
+            scale,
+            shades: vec![0; width * height],
+        }
+    }
+    // A soft, inset bevel: its outer edge is the actual window boundary.
+    fn edge(&mut self, a: (f64, f64), b: (f64, f64), inward: (f64, f64), depth: f64) {
+        let depth = depth.min(4.5) * self.scale;
+        if depth <= 0.0 || a == b {
             return;
         }
-        let origin = [a.0, a.1];
-        let mut spans = vec![(0.0_f64, 1.0_f64)];
-        for gap in gaps {
-            let (mut enter, mut exit) = (0.0_f64, 1.0_f64);
-            for axis in 0..2 {
-                // Half of the 1.1px contour width, before output scaling.
-                let (lo, hi) = (gap[axis] - 0.55, gap[axis + 2] + 0.55);
-                if delta[axis] == 0.0 {
-                    if origin[axis] < lo || origin[axis] > hi {
-                        enter = 1.0;
-                        exit = 0.0;
-                        break;
-                    }
-                } else {
-                    let t0 = (lo - origin[axis]) / delta[axis];
-                    let t1 = (hi - origin[axis]) / delta[axis];
-                    enter = enter.max(t0.min(t1));
-                    exit = exit.min(t0.max(t1));
+        let a = [a.0 * self.scale, a.1 * self.scale];
+        let b = [b.0 * self.scale, b.1 * self.scale];
+        let normal = [inward.0, inward.1];
+        let axis = usize::from(normal[1] != 0.0);
+        let lo = [
+            a[0].min(b[0]) + (normal[0] * depth).min(0.0),
+            a[1].min(b[1]) + (normal[1] * depth).min(0.0),
+        ];
+        let hi = [
+            a[0].max(b[0]) + (normal[0] * depth).max(0.0),
+            a[1].max(b[1]) + (normal[1] * depth).max(0.0),
+        ];
+        let x0 = (lo[0].floor().max(self.left as f64) as usize).min(self.left + self.width);
+        let x1 = (hi[0].ceil().max(0.0) as usize).min(self.left + self.width);
+        let y0 = (lo[1].floor().max(self.top as f64) as usize).min(self.top + self.height);
+        let y1 = (hi[1].ceil().max(0.0) as usize).min(self.top + self.height);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let pixel = [x as f64, y as f64];
+                let coverage = (hi[0].min(pixel[0] + 1.0) - lo[0].max(pixel[0])).max(0.0)
+                    * (hi[1].min(pixel[1] + 1.0) - lo[1].max(pixel[1])).max(0.0);
+                let t = ((pixel[axis] + 0.5 - a[axis]) * normal[axis] / depth).clamp(0.0, 1.0);
+                let fade = (1.0 - t) * (1.0 - t) * (1.0 + 2.0 * t);
+                let shade = (80.0 * coverage * fade * normal[axis]).round() as i16;
+                let slot = &mut self.shades[(y - self.top) * self.width + x - self.left];
+                if shade.abs() > slot.abs() || (shade.abs() == slot.abs() && shade < *slot) {
+                    *slot = shade;
                 }
             }
-            if exit <= enter {
-                continue;
-            }
-            spans = spans
-                .into_iter()
-                .flat_map(|(lo, hi)| {
-                    if exit <= lo || enter >= hi {
-                        vec![(lo, hi)]
-                    } else {
-                        vec![(lo, hi.min(enter)), (lo.max(exit), hi)]
-                    }
-                })
-                .filter(|(lo, hi)| hi - lo > 1e-9)
-                .collect();
         }
-        for (lo, hi) in spans {
-            self.path(
-                &[
-                    (a.0 + delta[0] * lo, a.1 + delta[1] * lo),
-                    (a.0 + delta[0] * hi, a.1 + delta[1] * hi),
-                ],
-                rgba(231, 243, 255, 205),
-                Some(1.1),
-                false,
+    }
+    fn paint(self, v: &mut Canvas) {
+        let stride = v.pix.width() as usize;
+        let pixels = v.pix.data_mut();
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let shade = self.shades[y * self.width + x];
+                if shade == 0 {
+                    continue;
+                }
+                let color = if shade > 0 {
+                    [255, 248, 220]
+                } else {
+                    [8, 15, 29]
+                };
+                let alpha = shade.unsigned_abs() as u32;
+                let at = ((self.top + y) * stride + self.left + x) * 4;
+                for k in 0..3 {
+                    pixels[at + k] =
+                        ((color[k] * alpha + pixels[at + k] as u32 * (255 - alpha)) / 255) as u8;
+                }
+            }
+        }
+    }
+}
+impl Canvas {
+    // All rectangles belong to one nonzero-winding path. Overlapping intervals
+    // are painted once, so dense JC windows never accumulate opacity.
+    fn union_rects(&mut self, rects: &[[f64; 4]], color: Color) {
+        let mut path = PathBuilder::new();
+        for &[x1, y1, x2, y2] in rects {
+            if let Some(rect) =
+                tiny_skia::Rect::from_xywh(x1 as f32, y1 as f32, (x2 - x1) as f32, (y2 - y1) as f32)
+            {
+                path.push_rect(rect);
+            }
+        }
+        if let Some(path) = path.finish() {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
+            self.pix.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::from_scale(self.scale, self.scale),
+                None,
             );
         }
     }
@@ -720,6 +789,158 @@ fn scroll_color(v: f64) -> Color {
     }
     color
 }
+#[allow(clippy::too_many_arguments)]
+fn draw_judgements(
+    v: &mut Canvas,
+    windows: &[Window],
+    options: &Options,
+    x: f64,
+    y: &impl Fn(f64) -> f64,
+    top: f64,
+    bottom: f64,
+    start: f64,
+    end: f64,
+) {
+    // Shared fills describe each displayed grade's union without assigning
+    // input ownership; soft per-note bevels retain the individual shapes.
+    let mut fills: [Vec<[f64; 4]>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut thin_attacks = Vec::new();
+    let mut contours = Vec::new();
+    for w in windows {
+        if w.note.time + 0.11 < start || w.note.time - 0.11 > end {
+            continue;
+        }
+        let first = w.note.lane as usize;
+        let last = (w.note.lane + w.note.width) as usize;
+        let mut all: Vec<_> = (first..last).map(|l| bands(w, l, options.easy)).collect();
+        if options.early_attack_only {
+            // Protection used the entire chart. Only the resulting display is
+            // filtered; even a subpixel early ATTACK qualifies this whole note.
+            if !all
+                .iter()
+                .flatten()
+                .any(|b| b.grade == "ATTACK" && b.from < 0.0 && b.to > b.from)
+            {
+                continue;
+            }
+            for lane in &mut all {
+                for band in lane.iter_mut() {
+                    band.to = band.to.min(0.0);
+                }
+                lane.retain(|b| b.to > b.from);
+            }
+        }
+        let mut i = 0;
+        while i < all.len() {
+            let mut j = i + 1;
+            while j < all.len() && all[j] == all[i] {
+                j += 1;
+            }
+            for band in &all[i] {
+                let yt = y(w.note.time + band.to).max(top);
+                let yb = y(w.note.time + band.from).min(bottom);
+                if yb <= yt {
+                    continue;
+                }
+                let xl = x + (first + i) as f64 * 10.0;
+                let rect = [xl, yt, xl + (j - i) as f64 * 10.0, yb];
+                if band.grade == "ATTACK" && (yb - yt) * v.scale as f64 <= 2.0 + 1e-9 {
+                    thin_attacks.push(rect);
+                } else {
+                    let index = match band.grade {
+                        "ATTACK" => 0,
+                        "JUSTICE" => 1,
+                        "TOUCH" => 2,
+                        _ => 3,
+                    };
+                    fills[index].push(rect);
+                }
+            }
+            i = j;
+        }
+        let bounds: Vec<_> = all
+            .iter()
+            .map(|bs| {
+                bs.first()
+                    .zip(bs.last())
+                    .map(|(a, b)| (y(w.note.time + b.to), y(w.note.time + a.from)))
+            })
+            .collect();
+        contours.push((first, bounds));
+    }
+    for (rects, name) in fills.iter().zip(["ATTACK", "JUSTICE", "TOUCH", "JC"]) {
+        v.union_rects(rects, grade(name));
+    }
+    if contours.is_empty() {
+        return;
+    }
+    let mut relief = Relief::new(v, x, x + 160.0, top, bottom);
+    for (first, bounds) in contours {
+        // Merge horizontal runs so lane boundaries do not produce raster seams.
+        for side in 0..2 {
+            let mut i = 0;
+            while i < bounds.len() {
+                let Some((yt, yb)) = bounds[i] else {
+                    i += 1;
+                    continue;
+                };
+                let edge = if side == 0 { yt } else { yb };
+                let mut depth = (yb - yt) / 2.0;
+                let mut j = i + 1;
+                while let Some(Some((nt, nb))) = bounds.get(j) {
+                    if (if side == 0 { *nt } else { *nb }) != edge {
+                        break;
+                    }
+                    depth = depth.min((nb - nt) / 2.0);
+                    j += 1;
+                }
+                relief.edge(
+                    (x + (first + i) as f64 * 10.0, edge),
+                    (x + (first + j) as f64 * 10.0, edge),
+                    (0.0, if side == 0 { 1.0 } else { -1.0 }),
+                    depth,
+                );
+                i = j;
+            }
+        }
+        for (i, bound) in bounds.iter().enumerate() {
+            let Some((yt, yb)) = *bound else {
+                continue;
+            };
+            if yb <= yt {
+                continue;
+            }
+            for (neighbor, edge_x, normal) in [
+                (
+                    i.checked_sub(1).and_then(|k| bounds[k]),
+                    x + (first + i) as f64 * 10.0,
+                    1.0,
+                ),
+                (
+                    bounds.get(i + 1).copied().flatten(),
+                    x + (first + i + 1) as f64 * 10.0,
+                    -1.0,
+                ),
+            ] {
+                // Only exposed sides: preserve EXT's steps without 16 lane seams.
+                let spans = if let Some((nt, nb)) = neighbor {
+                    [(yt, yb.min(nt)), (yt.max(nb), yb)]
+                } else {
+                    [(yt, yb), (0.0, 0.0)]
+                };
+                for (a, b) in spans {
+                    if b > a {
+                        relief.edge((edge_x, a), (edge_x, b), (normal, 0.0), 5.0);
+                    }
+                }
+            }
+        }
+    }
+    relief.paint(v);
+    // Preserve even subpixel ATTACK strips after all shading.
+    v.union_rects(&thin_attacks, rgba(57, 255, 136, 255));
+}
+
 pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
     let d = dimensions(c, o)?;
     let (layout, w, h) = sheet(c, o)?;
@@ -727,7 +948,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
     let pps = layout.pps;
     let bottom = h - FOOT - 44.0;
     let mut notes = c.notes.clone();
-    mark_critical_heads(&mut notes);
+    mark_critical_notes(&mut notes);
     let mut v = Canvas {
         pix: Pixmap::new(d.width, d.height).ok_or("Image allocation failed")?,
         scale: scale as f32,
@@ -740,8 +961,8 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
         clip_x: None,
     };
     v.pix.fill(tiny_skia::Color::from_rgba8(107, 114, 128, 255));
-    if o.judge {
-        v.rect(0.0, 0.0, w, 38.0, rgba(32, 43, 60, 255));
+    if o.shows_judgements() {
+        v.rect(0.0, 0.0, w, 60.0, rgba(32, 43, 60, 255));
         for (i, (label, g)) in [
             ("JUSTICE CRITICAL", "JC"),
             ("JUSTICE", "JUSTICE"),
@@ -749,6 +970,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
             ("FLICK TOUCH", "TOUCH"),
         ]
         .iter()
+        .take(if o.early_attack_only { 3 } else { 4 })
         .enumerate()
         {
             let x = 20.0 + [0.0, 202.0, 330.0, 450.0][i];
@@ -757,14 +979,29 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
             v.rect(x, 14.0, 10.0, 10.0, color);
             v.text(x + 17.0, 25.0, 15.0, label, rgba(238, 242, 252, 255));
         }
+        v.text(
+            20.0,
+            48.0,
+            11.0,
+            if o.early_attack_only {
+                "Early ATTACK bands only: pre-note ATTACK / JUSTICE / JC. All notes shown."
+            } else {
+                "JC: shared fill + soft relief per note. Overlap does not imply input ownership."
+            },
+            rgba(196, 211, 230, 255),
+        );
     }
-    let windows = if o.judge {
-        protect(&notes, o.easy)
+    let windows = if o.shows_judgements() {
+        protect_with_resolution(&notes, o.easy, c.resolution)
     } else {
         Vec::new()
     };
     let units = slide_units(c);
-    let divs = divisions(c);
+    let divs = if o.divisions {
+        divisions(c)
+    } else {
+        Vec::new()
+    };
     for (col, &(start, end)) in layout.ranges.iter().enumerate() {
         v.clip_x = None;
         let x = 68.0 + col as f64 * STRIDE;
@@ -845,7 +1082,7 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
                     long_path(&mut v, n, x, &y, top, bottom, units[i]);
                 }
             }
-            if !o.judge {
+            if !o.shows_judgements() {
                 for n in &notes {
                     if n.time >= start
                         && n.time < end
@@ -857,83 +1094,13 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
                 }
             }
         }
-        for w in &windows {
-            if w.note.time + 0.11 < start || w.note.time - 0.11 > end {
-                continue;
-            }
-            let first = w.note.lane as usize;
-            let last = (w.note.lane + w.note.width) as usize;
-            let all: Vec<_> = (first..last).map(|l| bands(w, l, o.easy)).collect();
-            // Merge equal adjacent lanes; a note's outer contour remains visible.
-            let mut i = 0;
-            let mut thin_attacks = Vec::new();
-            while i < all.len() {
-                let mut j = i + 1;
-                while j < all.len() && all[j] == all[i] {
-                    j += 1;
-                }
-                for b in &all[i] {
-                    let yt = y(w.note.time + b.to).max(top);
-                    let yb = y(w.note.time + b.from).min(bottom);
-                    let xl = x + (first + i) as f64 * 10.0;
-                    let width = (j - i) as f64 * 10.0;
-                    let thin = b.grade == "ATTACK" && yb > yt && (yb - yt) * scale <= 2.0 + 1e-9;
-                    if thin {
-                        thin_attacks.push([xl, yt, xl + width, yb]);
-                    }
-                    v.rect(
-                        xl,
-                        yt,
-                        width,
-                        yb - yt,
-                        if thin {
-                            rgba(57, 255, 136, 255)
-                        } else {
-                            grade(b.grade)
-                        },
-                    );
-                }
-                i = j;
-            }
-            let bounds: Vec<_> = all
-                .iter()
-                .map(|bs| {
-                    bs.first().zip(bs.last()).map(|(a, b)| {
-                        (
-                            y(w.note.time + b.to).max(top),
-                            y(w.note.time + a.from).min(bottom),
-                        )
-                    })
-                })
-                .collect();
-            for (i, b) in bounds.iter().enumerate() {
-                if let Some((yt, yb)) = *b {
-                    if yb <= yt {
-                        continue;
-                    }
-                    let xl = x + (first + i) as f64 * 10.0;
-                    let xr = xl + 10.0;
-                    v.outline_segment((xl, yt), (xr, yt), &thin_attacks);
-                    v.outline_segment((xl, yb), (xr, yb), &thin_attacks);
-                    let prev = i.checked_sub(1).and_then(|k| bounds[k]);
-                    if let Some((pt, pb)) = prev {
-                        v.outline_segment((xl, yt), (xl, pt), &thin_attacks);
-                        v.outline_segment((xl, yb), (xl, pb), &thin_attacks);
-                    } else {
-                        v.outline_segment((xl, yt), (xl, yb), &thin_attacks);
-                    }
-                    if i + 1 == bounds.len() || bounds[i + 1].is_none() {
-                        v.outline_segment((xr, yt), (xr, yb), &thin_attacks);
-                    }
-                }
-            }
-        }
+        draw_judgements(&mut v, &windows, o, x, &y, top, bottom, start, end);
 
         for n in &notes {
             if n.time >= start
                 && n.time < end
                 && !n.kind.starts_with('A')
-                && (o.judge || !matches!(n.kind.as_str(), "HLD_T" | "SLD_H" | "SLD_T"))
+                && (o.shows_judgements() || !matches!(n.kind.as_str(), "HLD_T" | "SLD_H" | "SLD_T"))
             {
                 glyph(&mut v, n, x, y(n.time), top, bottom);
             }

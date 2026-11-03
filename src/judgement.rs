@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Independently named port of UMIGURI cw(); see NOTICE for reference revision.
-use crate::chart::{Note, mark_critical_heads};
+// Static ground-note protection reconstructed from chusanApp.exe; see NOTICE.
+// These are internal windows, not input ownership in a particular playthrough.
+use crate::chart::{Note, mark_critical_notes};
 use serde::Serialize;
+
+const FIX: f64 = 2.0 / 60.0;
+const SAME_BEAT: f64 = 1.0 / 192.0;
+
 #[derive(Clone, Debug)]
 pub struct Window {
     pub note: Note,
+    /// Positive distance before the note, in seconds.
     pub early: [f64; 16],
+    /// Negative distance after the note, retained for API compatibility.
     pub late: [f64; 16],
+    /// Negative distance to the latest covered lane's miss boundary.
     pub miss: f64,
 }
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -15,147 +23,119 @@ pub struct Band {
     pub from: f64,
     pub to: f64,
 }
-fn overlap(a: &Note, b: &Note) -> bool {
-    a.lane < b.lane + b.width && b.lane < a.lane + a.width
-}
-fn inside(l: usize, a: &Note, b: &Note) -> bool {
-    (l as f64) >= a.lane.max(b.lane) && (l as f64) < (a.lane + a.width).min(b.lane + b.width)
-}
-pub fn supported(input: &[Note]) -> bool {
-    input
-        .iter()
-        .filter(|n| n.ground())
-        .all(|n| n.lane >= 0.0 && n.lane + n.width <= 16.0)
+
+fn outer(note: &Note, easy: bool) -> f64 {
+    // FLICK.TAP has a fixed +/-5-frame profile, including on EASY charts.
+    (if easy && note.kind != "FLK" { 6.0 } else { 5.0 }) / 60.0
 }
 
-// Off-lane geometry has no verified judgement model; only the ordinary renderer supports it.
+pub fn supported(input: &[Note]) -> bool {
+    input.iter().filter(|n| n.ground()).all(|n| {
+        n.time.is_finite()
+            && n.tick.is_finite()
+            && n.tick >= 0.0
+            && n.lane >= 0.0
+            && n.lane.fract() == 0.0
+            && n.width > 0.0
+            && n.width.fract() == 0.0
+            && n.lane + n.width <= 16.0
+    })
+}
+
+/// Internal windows for notes expressed at the usual C2S resolution of 384.
+/// `tick` and `time` must describe the same chart position. For other resolutions,
+/// use `protect_with_resolution`: the EXE's same-position tolerance is in beats.
 pub fn protect(input: &[Note], easy: bool) -> Vec<Window> {
-    if !supported(input) {
+    protect_with_resolution(input, easy, 384.0)
+}
+
+/// Apply the default TAP/EXT/FLICK.TAP profiles and pair protection.
+/// AIR, MINE, sustained judgements and FLICK.SLASH are outside this model.
+pub fn protect_with_resolution(input: &[Note], easy: bool, resolution: f64) -> Vec<Window> {
+    if !supported(input) || !resolution.is_finite() || resolution <= 0.0 {
         return Vec::new();
     }
-    let jc = 2.0 / 60.0;
-    let attack: f64 = if easy { 6.0 } else { 5.0 } / 60.0;
-    let mut input = input.to_vec();
-    mark_critical_heads(&mut input);
-    let mut ns: Vec<_> = input
-        .iter()
-        .filter(|n| n.ground())
-        .map(|n| Window {
-            note: n.clone(),
-            early: [f64::INFINITY; 16],
-            late: [f64::NEG_INFINITY; 16],
-            miss: 0.0,
+    let mut notes = input.to_vec();
+    mark_critical_notes(&mut notes);
+    let mut ws: Vec<_> = notes
+        .into_iter()
+        .filter(Note::ground)
+        .map(|note| {
+            let max = outer(&note, easy);
+            Window {
+                note,
+                early: [max; 16],
+                late: [-max; 16],
+                miss: -max,
+            }
         })
         .collect();
-    ns.sort_by(|a, b| a.note.time.total_cmp(&b.note.time));
-    for i in 0..ns.len() {
-        let (before, rest) = ns.split_at_mut(i);
-        let b = &mut rest[0];
-        if i == 0 {
-            b.early.fill(attack);
-            continue;
-        }
-        for a in before.iter() {
-            if a.note.time >= b.note.time {
+    ws.sort_by(|a, b| a.note.time.total_cmp(&b.note.time));
+
+    // 0x0119DBA0: candidates depend on ORIGINAL timestamps, never on another
+    // note's shortened window. Previously tightened distances only shrink.
+    let max_pair_gap = (if easy { 12.0 } else { 10.0 }) / 60.0;
+    for j in 0..ws.len() {
+        let (left, right) = ws.split_at_mut(j);
+        let b = &mut right[0];
+        for a in left.iter_mut().rev() {
+            let dt = b.note.time - a.note.time;
+            if dt >= max_pair_gap {
                 break;
             }
-            if !overlap(&a.note, &b.note) {
+            let beat_gap = (b.note.tick - a.note.tick) * 4.0 / resolution;
+            if dt <= 0.0
+                || beat_gap <= SAME_BEAT
+                || dt >= outer(&a.note, easy) + outer(&b.note, easy)
+            {
                 continue;
             }
-            let half = (b.note.time - a.note.time) / 2.0;
-            for l in 0..16 {
-                b.early[l] = b.early[l].min(if inside(l, &a.note, &b.note) {
-                    half
-                } else if b.note.critical() || b.note.kind == "FLK" {
-                    attack
-                } else {
-                    half.max(jc)
-                });
+            let first = a.note.lane.max(b.note.lane) as usize;
+            let last = (a.note.lane + a.note.width).min(b.note.lane + b.note.width) as usize;
+            let distance = (dt / 2.0).max(FIX);
+            for lane in first..last {
+                a.late[lane] = a.late[lane].max(-distance);
+                b.early[lane] = b.early[lane].min(distance);
             }
         }
     }
-    for i in 0..ns.len() {
-        let (before, after) = ns.split_at_mut(i + 1);
-        let a = &mut before[i];
-        for b in after.iter().rev() {
-            let dt = b.note.time - a.note.time;
-            if dt <= 0.0 {
-                break;
-            }
-            if !overlap(&a.note, &b.note) {
-                continue;
-            }
-            if a.note.critical() {
-                for l in 0..16 {
-                    a.late[l] = a.late[l].max(if inside(l, &a.note, &b.note) {
-                        -dt + b.early[l]
-                    } else {
-                        -attack
-                    });
-                }
-            } else {
-                let edge = a.late[a.note.lane as usize]
-                    .max(-dt + b.early[a.note.lane.max(b.note.lane) as usize]);
-                for l in 0..16 {
-                    a.late[l] = if inside(l, &a.note, &b.note) {
-                        edge.max(-dt + b.early[l])
-                    } else {
-                        a.late[l].max(edge.min(-jc))
-                    };
-                }
-            }
+    // 0x0119DF70: MINIMALIZE runs after all pairs. TAP and FLICK.TAP propagate
+    // the tightest side across the note; EXT retains per-lane notches.
+    for w in &mut ws {
+        let first = w.note.lane as usize;
+        let last = (w.note.lane + w.note.width) as usize;
+        if !w.note.critical() {
+            let early = w.early[first..last]
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min);
+            let late = w.late[first..last]
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            w.early.fill(early);
+            w.late.fill(late);
         }
-        for l in a.note.lane as usize..(a.note.lane + a.note.width) as usize {
-            a.miss = a.miss.min(a.late[l].max(-attack));
-        }
+        w.miss = w.late[first..last].iter().copied().fold(0.0, f64::min);
     }
-    for i in 0..ns.len() {
-        let (before, after) = ns.split_at_mut(i + 1);
-        let a = &before[i];
-        for b in after {
-            let dt = b.note.time - a.note.time;
-            if dt <= 0.0 || !overlap(&a.note, &b.note) {
-                continue;
-            }
-            if b.note.critical() {
-                for l in 0..16 {
-                    if inside(l, &a.note, &b.note) {
-                        b.early[l] = dt + a.late[l];
-                    }
-                }
-            } else {
-                let mut edge = f64::INFINITY;
-                for l in 0..16 {
-                    if inside(l, &a.note, &b.note) {
-                        edge = edge.min(dt + a.late[l]);
-                    }
-                }
-                for l in 0..16 {
-                    b.early[l] = if inside(l, &a.note, &b.note) {
-                        edge
-                    } else {
-                        edge.max(jc).min(b.early[l])
-                    };
-                }
-            }
-        }
-    }
-    ns
+    ws
 }
+
 pub fn bands(w: &Window, l: usize, easy: bool) -> Vec<Band> {
-    let attack: f64 = if easy { 6.0 } else { 5.0 } / 60.0;
+    let attack = outer(&w.note, easy);
     let lo = -attack.min(w.early[l]);
     let hi = -(-attack).max(w.late[l]).max(w.miss);
     let ranges: Vec<(&str, f64, f64)> = if w.note.kind == "FLK" {
-        vec![("TOUCH", -5.0 / 60.0, 5.0 / 60.0)]
+        // Entry-touch eligibility only. Slash timing/movement is a separate stage.
+        vec![("TOUCH", -attack, attack)]
     } else if w.note.critical() {
         vec![("JC", -attack, attack)]
     } else {
         vec![
             ("ATTACK", -attack, -4.0 / 60.0),
-            ("JUSTICE", -4.0 / 60.0, -2.0 / 60.0),
-            ("JC", -2.0 / 60.0, 2.0 / 60.0),
-            ("JUSTICE", 2.0 / 60.0, 4.0 / 60.0),
+            ("JUSTICE", -4.0 / 60.0, -FIX),
+            ("JC", -FIX, FIX),
+            ("JUSTICE", FIX, 4.0 / 60.0),
             ("ATTACK", 4.0 / 60.0, attack),
         ]
     };

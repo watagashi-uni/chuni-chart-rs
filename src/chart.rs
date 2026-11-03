@@ -22,16 +22,18 @@ impl Note {
         )
     }
     pub fn critical(&self) -> bool {
-        self.kind == "CHR" || (matches!(self.kind.as_str(), "HLD_H" | "SLD_H") && self.critical)
+        self.kind == "CHR"
+            || (matches!(self.kind.as_str(), "TAP" | "HLD_H" | "SLD_H") && self.critical)
     }
 }
-// Same-time CHR intervals may extend beyond either edge, or jointly cover a head.
-// Keep the long-note type so its body, tail and identity remain unchanged.
-pub fn mark_critical_heads(notes: &mut [Note]) {
+/// Apply complete EXT coverage at the same quantized chart tick.
+/// Keep the source kind; `critical()` identifies the effective judgement type.
+/// 0x011A24A0 also promotes TAPs and accepts already critical long-note heads.
+pub fn mark_critical_notes(notes: &mut [Note]) {
     let mut coverage = std::collections::HashMap::<_, Vec<(f64, f64)>>::new();
-    for n in notes.iter().filter(|n| n.kind == "CHR") {
+    for n in notes.iter().filter(|n| n.critical()) {
         coverage
-            .entry((n.tick.to_bits(), n.time.to_bits()))
+            .entry(n.tick.round() as i64)
             .or_default()
             .push((n.lane, n.lane + n.width));
     }
@@ -40,9 +42,9 @@ pub fn mark_critical_heads(notes: &mut [Note]) {
     }
     for n in notes
         .iter_mut()
-        .filter(|n| matches!(n.kind.as_str(), "HLD_H" | "SLD_H"))
+        .filter(|n| matches!(n.kind.as_str(), "TAP" | "HLD_H" | "SLD_H"))
     {
-        if let Some(ranges) = coverage.get(&(n.tick.to_bits(), n.time.to_bits())) {
+        if let Some(ranges) = coverage.get(&(n.tick.round() as i64)) {
             let mut end = n.lane;
             for &(left, right) in ranges {
                 if left > end {
@@ -56,6 +58,10 @@ pub fn mark_critical_heads(notes: &mut [Note]) {
             }
         }
     }
+}
+/// Compatibility alias. Complete coverage applies to TAPs as well as heads.
+pub fn mark_critical_heads(notes: &mut [Note]) {
+    mark_critical_notes(notes);
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct LongNote {
@@ -389,7 +395,7 @@ impl Chart {
             }
             n.time = t;
         }
-        mark_critical_heads(&mut c.notes);
+        mark_critical_notes(&mut c.notes);
         let times: Vec<_> = c
             .longs
             .iter()

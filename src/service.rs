@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-use crate::{MAX_INPUT_BYTES, MAX_OUTPUT_BYTES, Result, render::Options};
+use crate::{
+    MAX_INPUT_BYTES, MAX_OUTPUT_BYTES, Result,
+    config::Config,
+    etag::{self, EtagKey},
+    render::Options,
+    storage::{ChartRoot, ReadError},
+};
 use axum::{
     Router,
-    extract::{Query, State},
-    http::{StatusCode, header},
+    extract::{Path as UrlPath, Query, State, rejection::QueryRejection},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::get,
 };
@@ -19,7 +26,9 @@ use tokio::{
 };
 #[derive(Clone)]
 struct App {
-    root: PathBuf,
+    root: Arc<ChartRoot>,
+    etag: EtagKey,
+    reads: Arc<Semaphore>,
     slots: Arc<Semaphore>,
     timeout: Duration,
 }
@@ -31,27 +40,28 @@ pub struct Job {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Params {
-    name: String,
+    name: Option<String>,
     judge: Option<u8>,
+    early_attack_only: Option<u8>,
+    fastattack: Option<u8>,
+    div: Option<u8>,
     easy: Option<u8>,
     format: Option<String>,
     column: Option<usize>,
     zoom: Option<f64>,
 }
 pub fn chart_path(root: &Path, name: &str) -> Result<PathBuf> {
-    let base = name.strip_suffix(".c2s").unwrap_or(name);
-    if base.is_empty()
-        || base.len() > 80
-        || !base
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    let filename = crate::storage::chart_name(name)?;
+    let candidate = root.join(filename);
+    if !candidate
+        .symlink_metadata()
+        .map_err(|_| "Chart not found")?
+        .file_type()
+        .is_file()
     {
-        return Err("Invalid chart filename".into());
+        return Err("Chart not found".into());
     }
-    let path = root
-        .join(format!("{base}.c2s"))
-        .canonicalize()
-        .map_err(|_| "Chart not found")?;
+    let path = candidate.canonicalize().map_err(|_| "Chart not found")?;
     if !path.starts_with(root) || !path.is_file() {
         return Err("Chart not found".into());
     }
@@ -81,6 +91,7 @@ pub async fn run_worker(job: Job, timeout: Duration) -> Result<Vec<u8>> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .env_remove("ETAG_SALT")
         .kill_on_drop(true);
     #[cfg(target_os = "linux")]
     unsafe {
@@ -104,6 +115,15 @@ pub async fn run_worker(job: Job, timeout: Duration) -> Result<Vec<u8>> {
     let mut child = command
         .spawn()
         .map_err(|_| "Cannot start bounded render worker")?;
+    #[cfg(windows)]
+    let _job = match crate::worker_limits::attach(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
+    };
     let mut stdin = child.stdin.take().ok_or("Worker stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("Worker stdout unavailable")?;
     let payload = serde_json::to_vec(&job).map_err(|_| "Cannot encode worker input")?;
@@ -175,115 +195,277 @@ fn error(status: StatusCode, message: &str) -> Response {
     )
         .into_response()
 }
-async fn preview(State(app): State<App>, Query(p): Query<Params>) -> Response {
-    generate(app, p, false).await
+type ParsedParams = std::result::Result<Query<Params>, QueryRejection>;
+#[derive(Clone, Copy)]
+enum Mode {
+    Preview,
+    Judge,
+    FastAttack,
 }
-async fn judge(State(app): State<App>, Query(p): Query<Params>) -> Response {
-    generate(app, p, true).await
+async fn preview(State(app): State<App>, headers: HeaderMap, query: ParsedParams) -> Response {
+    generate(app, headers, query, Mode::Preview, None).await
 }
-async fn generate(app: App, p: Params, forced: bool) -> Response {
-    if p.judge.is_some_and(|v| v > 1) || p.easy.is_some_and(|v| v > 1) {
+async fn judge(State(app): State<App>, headers: HeaderMap, query: ParsedParams) -> Response {
+    generate(app, headers, query, Mode::Judge, None).await
+}
+async fn fastattack(State(app): State<App>, headers: HeaderMap, query: ParsedParams) -> Response {
+    generate(app, headers, query, Mode::FastAttack, None).await
+}
+async fn named_preview(
+    State(app): State<App>,
+    UrlPath(name): UrlPath<String>,
+    headers: HeaderMap,
+    query: ParsedParams,
+) -> Response {
+    generate(app, headers, query, Mode::Preview, Some(name)).await
+}
+async fn named_fastattack(
+    State(app): State<App>,
+    UrlPath(name): UrlPath<String>,
+    headers: HeaderMap,
+    query: ParsedParams,
+) -> Response {
+    generate(app, headers, query, Mode::FastAttack, Some(name)).await
+}
+fn busy() -> Response {
+    let mut response = error(StatusCode::TOO_MANY_REQUESTS, "Renderer busy; retry later");
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+    response
+}
+fn cache_headers(response: &mut Response, tag: &str) {
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(tag).expect("Generated ASCII ETag"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+}
+fn not_modified(tag: &str) -> Response {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    cache_headers(&mut response, tag);
+    response
+}
+async fn generate(
+    app: App,
+    headers: HeaderMap,
+    query: ParsedParams,
+    mode: Mode,
+    path_name: Option<String>,
+) -> Response {
+    let Ok(Query(mut p)) = query else {
+        return error(StatusCode::BAD_REQUEST, "Invalid query parameters");
+    };
+    if let Some(name) = path_name {
+        if p.name.is_some() {
+            return error(StatusCode::BAD_REQUEST, "Specify chart name only once");
+        }
+        p.name = Some(name);
+    }
+    let Some(name) = p.name else {
+        return error(StatusCode::BAD_REQUEST, "Chart name is required");
+    };
+    if crate::storage::chart_name(&name).is_err() {
+        return error(StatusCode::NOT_FOUND, "Chart not found");
+    }
+    if [p.judge, p.easy, p.early_attack_only, p.fastattack, p.div]
+        .into_iter()
+        .flatten()
+        .any(|v| v > 1)
+    {
         return error(StatusCode::BAD_REQUEST, "Flags must be 0 or 1");
     }
-    let format = p.format.unwrap_or_else(|| "png".into());
+    let mut format = p.format.unwrap_or_else(|| "png".into());
     if !matches!(format.as_str(), "png" | "jpg" | "jpeg") {
         return error(StatusCode::BAD_REQUEST, "Unsupported image format");
     }
-    let Ok(permit) = app.slots.clone().try_acquire_owned() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [
-                (header::RETRY_AFTER, "2"),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            "Renderer busy; retry later",
-        )
-            .into_response();
+    if format == "jpeg" {
+        format = "jpg".into();
+    }
+    let zoom = p.zoom.unwrap_or(1.0);
+    if !zoom.is_finite() || !(0.5..=2.0).contains(&zoom) || p.column == Some(0) {
+        return error(StatusCode::BAD_REQUEST, "Invalid zoom or column");
+    }
+    let early = matches!(mode, Mode::FastAttack)
+        || p.fastattack == Some(1)
+        || p.early_attack_only == Some(1);
+    let judge = !matches!(mode, Mode::Preview) || p.judge == Some(1) || early;
+    let options = Options {
+        judge,
+        early_attack_only: early,
+        easy: judge && p.easy == Some(1),
+        divisions: p.div != Some(0),
+        format,
+        column: p.column,
+        zoom,
     };
-    let path = match chart_path(&app.root, &p.name) {
-        Ok(p) => p,
-        Err(_) => return error(StatusCode::NOT_FOUND, "Chart not found"),
+    // Bounded file I/O runs outside async runtime threads. Keep the permit with
+    // the returned bytes so concurrent prepared requests cannot accumulate them.
+    let Ok(read_permit) = app.reads.clone().try_acquire_owned() else {
+        return busy();
     };
-    let chart = match read_chart(&path) {
-        Ok(c) => c,
-        Err(_) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "Cannot read chart or input exceeds limit",
-            );
+    let root = app.root.clone();
+    let key = app.etag.clone();
+    let hash_options = options.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let result = root.read(&name).map(|chart| {
+            let tag = key.tag(&chart, &hash_options);
+            (chart, tag)
+        });
+        (result, read_permit)
+    })
+    .await;
+    let Ok((prepared, _read_permit)) = prepared else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read chart");
+    };
+    let (chart, tag) = match prepared {
+        Ok(pair) => pair,
+        Err(ReadError::NotFound) => return error(StatusCode::NOT_FOUND, "Chart not found"),
+        Err(ReadError::TooLarge) => {
+            return error(StatusCode::BAD_REQUEST, "Chart exceeds input limit");
+        }
+        Err(ReadError::Invalid) => {
+            return error(StatusCode::UNPROCESSABLE_ENTITY, "Cannot read chart");
         }
     };
-    let content = if format == "png" {
+    // Matching content validators bypass the render slot and subprocess entirely.
+    if etag::matches(&headers, &tag) {
+        return not_modified(&tag);
+    }
+    let Ok(permit) = app.slots.clone().try_acquire_owned() else {
+        return busy();
+    };
+    let content = if options.format == "png" {
         "image/png"
     } else {
         "image/jpeg"
     };
-    let job = Job {
-        chart,
-        options: Options {
-            judge: forced || p.judge == Some(1),
-            easy: p.easy == Some(1),
-            format,
-            column: p.column,
-            zoom: p.zoom.unwrap_or(1.0),
-        },
-    };
-    match run_worker(job, app.timeout).await {
-        Ok(bytes) => (
-            [
-                (header::CONTENT_TYPE, content),
-                (header::CACHE_CONTROL, "no-store"),
-                (
-                    header::HeaderName::from_static("x-content-type-options"),
-                    "nosniff",
-                ),
-            ],
-            axum::body::Body::new(ImageBody {
-                bytes: bytes.into(),
-                _permit: permit,
-            }),
-        )
-            .into_response(),
+    match run_worker(Job { chart, options }, app.timeout).await {
+        Ok(bytes) => {
+            // A wildcard did not prove this chart previously rendered. Validate
+            // it first, so malformed input cannot receive a successful 304.
+            if etag::wildcard(&headers) {
+                return not_modified(&tag);
+            }
+            let mut response = (
+                [(header::CONTENT_TYPE, content)],
+                axum::body::Body::new(ImageBody {
+                    bytes: bytes.into(),
+                    _permit: permit,
+                }),
+            )
+                .into_response();
+            cache_headers(&mut response, &tag);
+            response
+        }
         Err(e) => error(StatusCode::UNPROCESSABLE_ENTITY, &e),
     }
 }
-pub fn router(root: PathBuf, timeout: Duration) -> Router {
-    Router::new()
+async fn response_policy(request: Request<axum::body::Body>, next: Next) -> Response {
+    let mut response = if request.uri().to_string().len() > 2048 {
+        error(StatusCode::URI_TOO_LONG, "Request URI too long")
+    } else if request
+        .headers()
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .map(|v| v.as_bytes().len())
+        .sum::<usize>()
+        > 8192
+    {
+        error(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "Conditional header too large",
+        )
+    } else {
+        next.run(request).await
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' blob:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"));
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
+pub fn router(root: PathBuf, timeout: Duration) -> Result<Router> {
+    router_with_config(&Config {
+        chart_dir: root,
+        timeout_seconds: timeout.as_secs(),
+        ..Config::default()
+    })
+}
+pub fn router_with_config(config: &Config) -> Result<Router> {
+    config.validate()?;
+    let app = App {
+        root: Arc::new(ChartRoot::open(&config.chart_dir)?),
+        etag: EtagKey::new(config.etag_salt.as_deref())?,
+        reads: Arc::new(Semaphore::new(4)),
+        slots: Arc::new(Semaphore::new(1)),
+        timeout: Duration::from_secs(config.timeout_seconds),
+    };
+    Ok(Router::new()
         .route(
             "/",
             get(|| async { Html(include_str!("../assets/index.html")) }),
         )
+        .route(
+            "/app.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../assets/app.js"),
+                )
+            }),
+        )
         .route("/healthz", get(|| async { "ok" }))
         .route("/preview", get(preview))
         .route("/api/render", get(preview))
+        .route("/api/render/{name}", get(named_preview))
         .route("/judge", get(judge))
-        .with_state(App {
-            root,
-            slots: Arc::new(Semaphore::new(1)),
-            timeout,
-        })
+        .route("/fastattack", get(fastattack))
+        .route("/fastattack/{name}", get(named_fastattack))
+        .fallback(|| async { error(StatusCode::NOT_FOUND, "Not found") })
+        .layer(middleware::from_fn(response_policy))
+        .with_state(app))
 }
 pub async fn serve(root: PathBuf, listen: &str, timeout: u64) -> Result<()> {
-    let root = root
-        .canonicalize()
-        .map_err(|_| "CHART_DIR does not exist")?;
-    if !root.is_dir() {
-        return Err("CHART_DIR must be a directory".into());
-    }
-    let listener = tokio::net::TcpListener::bind(listen)
+    serve_config(Config {
+        chart_dir: root,
+        listen: listen.into(),
+        timeout_seconds: timeout,
+        ..Config::default()
+    })
+    .await
+}
+pub async fn serve_config(config: Config) -> Result<()> {
+    let app = router_with_config(&config)?;
+    let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .map_err(|_| "Cannot bind listen address")?;
     eprintln!(
-        "Listening on {} (one worker, 256 MiB Linux worker limit)",
+        "Listening on {} (one bounded render worker)",
         listener.local_addr().map_err(|_| "Address unavailable")?
     );
-    axum::serve(
-        listener,
-        router(root, Duration::from_secs(timeout.clamp(1, 30))),
-    )
-    .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await
-    .map_err(|_| "HTTP server failed".into())
+    if config.etag_salt.is_none() {
+        eprintln!(
+            "Using a per-process ETag salt; run init-config for validators that survive restarts."
+        );
+    }
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .map_err(|_| "HTTP server failed".into())
 }

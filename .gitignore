@@ -2,3 +2,7 @@
 /charts/
 /dist/
 *.log
+/config.json
+/config.local.json
+__pycache__/
+*.pyc

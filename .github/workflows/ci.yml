@@ -3,19 +3,69 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 permissions:
   contents: read
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  test-and-package:
+    name: Test and package (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            target: x86_64-unknown-linux-musl
+            executable: chuni-chart-rs
+            rustflags: ''
+          - os: windows-latest
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            executable: chuni-chart-rs.exe
+            rustflags: '-C target-feature=+crt-static'
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable installer
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
-      - run: cargo build --release --locked
-      - run: python3 scripts/smoke.py
+      - run: cargo clippy --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+      - run: cargo test --release --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Exercise real API and resource limits
+        run: python scripts/smoke.py target/${{ matrix.target }}/release/${{ matrix.executable }}
+      - name: Check conditional GET and source isolation
+        run: python scripts/security_http.py target/${{ matrix.target }}/release/${{ matrix.executable }}
+      - name: Package executable and public example configuration
+        run: python scripts/package.py --platform ${{ matrix.platform }} --binary target/${{ matrix.target }}/release/${{ matrix.executable }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: cargo-audit
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit --deny unsound

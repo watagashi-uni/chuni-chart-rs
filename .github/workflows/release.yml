@@ -3,25 +3,41 @@ on:
   push:
     tags: ['v*']
 permissions:
-  contents: write
+  contents: read
 jobs:
-  linux:
+  validate-and-build:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: validate-and-build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          targets: x86_64-unknown-linux-musl
-      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
-      - name: Package and publish
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify package set and create SHA-256 checksums
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+          files = sorted(Path('dist').iterdir())
+          assert [p.name for p in files] == ['chuni-chart-rs-linux-x64.tar.gz', 'chuni-chart-rs-windows-x64.zip']
+          Path('dist/SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.name + '\n' for p in files))
+          PY
+      - name: Publish tested binaries
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p dist/package
-          cp target/x86_64-unknown-linux-musl/release/chuni-chart-rs LICENSE NOTICE README.md dist/package/
-          cp assets/FONT-LICENSE dist/package/
-          cp -r deploy dist/package/
-          tar -czf dist/chuni-chart-rs-linux-x64.tar.gz -C dist/package .
-          cd dist
-          sha256sum chuni-chart-rs-linux-x64.tar.gz > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" chuni-chart-rs-linux-x64.tar.gz SHA256SUMS --title "$GITHUB_REF_NAME" --notes 'Linux x86_64 static binary. See README for file-directory and systemd deployment.'
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$RELEASE_TAG"
+          dist/chuni-chart-rs-linux-x64.tar.gz
+          dist/chuni-chart-rs-windows-x64.zip
+          dist/SHA256SUMS
+          --verify-tag --title "$RELEASE_TAG" --notes-file CHANGELOG.md

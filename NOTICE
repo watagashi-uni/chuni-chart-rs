@@ -15,11 +15,16 @@ It is based on the standalone parser/calculation port in:
 https://github.com/watagashi-uni/chuni-judgement
 Original contributors' rights are retained.
 
-Judgement behaviour reference:
+Original judgement behaviour reference:
 https://github.com/pingfanH/umiguri-re
 Commit 3aa8ebc53030cd178d5d90201e4ae2036f61c0bd
-The independently named numerical implementation follows the static
-eligibility rules in cw() and normal timing constants in judgeWindows.
+The original numerical implementation followed cw() and judgeWindows.
+The current ground-note protection instead follows independently recovered
+static rules in chusanApp.exe: original pair-time midpoints, FIX lower bounds,
+per-type MINIMALIZE, and complete EXT coverage. The analyzed binary SHA-256 is
+77ad8c04046ac895fc777a5eb66e6c6f23bd5a6bbf1dbb11f7b2f64adaba1123.
+This implements normal TAP/EXT and FLICK touch windows, not a complete game
+input/state simulator. Attribution to the earlier reference is retained.
 No game bundle, art, sound or upstream source file is redistributed here.
 This project does not relicense those external works.
 

@@ -42,35 +42,47 @@ fn malformed_and_expanding_inputs() {
 struct Case {
     notes: Vec<Note>,
     easy: bool,
-    expected: Vec<Expected>,
-}
-#[derive(Deserialize)]
-struct Expected {
-    note: serde_json::Value,
-    lanes: Vec<Vec<serde_json::Value>>,
 }
 #[test]
-fn numerical_regression_against_javascript_port() {
+fn protection_is_bounded_and_independent_of_input_order() {
+    // Retained random inputs from the original reference suite, now with
+    // coherent chart ticks at BPM 120. Old JS outputs are not the EXE oracle.
     let cases: Vec<Case> = serde_json::from_str(include_str!("fixtures/protection.json")).unwrap();
-    for (i, c) in cases.iter().enumerate() {
+    for c in cases {
         let actual = protect(&c.notes, c.easy);
-        assert_eq!(actual.len(), c.expected.len());
-        for (w, e) in actual.iter().zip(&c.expected) {
-            assert_eq!(w.note.kind, e.note["type"]);
-            for (lane, expected) in
-                (w.note.lane as usize..(w.note.lane + w.note.width) as usize).zip(&e.lanes)
-            {
-                let bs = bands(w, lane, c.easy);
-                assert_eq!(
-                    bs.len(),
-                    expected.len(),
-                    "case {i}, note {:?}, lane {lane}, actual {bs:?}, expected {expected:?}",
-                    w.note
-                );
-                for (b, e) in bs.iter().zip(expected) {
-                    assert_eq!(b.grade, e["grade"]);
-                    assert!((b.from - e["from"].as_f64().unwrap()).abs() < 1e-12);
-                    assert!((b.to - e["to"].as_f64().unwrap()).abs() < 1e-12);
+        let mut reversed = c.notes.clone();
+        reversed.reverse();
+        let reversed = protect(&reversed, c.easy);
+        let signature = |ws: &[chuni_chart_rs::judgement::Window]| {
+            let mut rows: Vec<_> = ws
+                .iter()
+                .map(|w| {
+                    serde_json::to_string(&serde_json::json!({
+                        "note": w.note, "early": w.early, "late": w.late, "miss": w.miss
+                    }))
+                    .unwrap()
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(signature(&actual), signature(&reversed));
+        for w in &actual {
+            let outer = (if c.easy && w.note.kind != "FLK" {
+                6.0
+            } else {
+                5.0
+            }) / 60.0;
+            for lane in w.note.lane as usize..(w.note.lane + w.note.width) as usize {
+                assert!((2.0 / 60.0..=outer).contains(&w.early[lane]));
+                assert!((2.0 / 60.0..=outer).contains(&-w.late[lane]));
+                if !w.note.critical() {
+                    assert_eq!(w.early[lane], w.early[w.note.lane as usize]);
+                    assert_eq!(w.late[lane], w.late[w.note.lane as usize]);
+                }
+                for b in bands(w, lane, c.easy) {
+                    assert!(b.from.is_finite() && b.to.is_finite() && b.to > b.from);
+                    assert!(b.from >= -outer && b.to <= outer);
                 }
             }
         }
@@ -117,13 +129,13 @@ fn critical_coverage_promotes_full_heads_with_overhangs_and_protection() {
                 }
                 let attack = if easy { 0.1 } else { 5.0 / 60.0 };
                 assert!((bands(w, 4, easy)[0].to - attack).abs() < 1e-12);
-                assert!((bands(w, 7, easy)[0].to - 0.025).abs() < 1e-12);
+                assert!((bands(w, 7, easy)[0].to - 2.0 / 60.0).abs() < 1e-12);
             }
         }
     }
 }
 #[test]
-fn partial_gapped_or_different_time_critical_does_not_promote_heads_or_tails() {
+fn partial_gapped_or_different_tick_critical_does_not_promote_heads_or_tails() {
     for cover in [
         "CHR 0 192 0 6",
         "CHR 0 192 0 5\nCHR 0 192 6 6",
@@ -142,7 +154,7 @@ fn partial_gapped_or_different_time_critical_does_not_promote_heads_or_tails() {
     assert!(
         c.notes
             .iter()
-            .filter(|n| n.kind == "HLD_T" || n.kind == "TAP")
+            .filter(|n| n.kind == "HLD_T")
             .all(|n| !n.critical())
     );
 }
@@ -158,46 +170,184 @@ fn decode_png(c: &Chart, o: &Options) -> (u32, u32, Vec<u8>) {
 }
 
 #[test]
+fn early_attack_mode_filters_after_protection_and_draws_only_early_bands() {
+    let chart = Chart::parse(
+        "BPM_DEF 120\nCHR 0 144 0 4\nTAP 0 163.2 0 4\nTAP 0 240 4 4\n\
+         HLD 0 288 8 4 96\nSLD 1 0 12 4 96 12 4\n\
+         FLK 0 192 12 4\nAIR 0 240 12 4\nMNE 0 216 12 4",
+    )
+    .unwrap();
+    for easy in [false, true] {
+        // The mode must imply judge even when the caller leaves judge=false.
+        let options = Options {
+            early_attack_only: true,
+            easy,
+            zoom: 2.0,
+            ..Default::default()
+        };
+        let (width, height, selected) = decode_png(&chart, &options);
+        let all_options = Options {
+            judge: true,
+            early_attack_only: false,
+            ..options.clone()
+        };
+        let (all_width, all_height, all) = decode_png(&chart, &all_options);
+        assert_eq!((width, height), (all_width, all_height));
+        let mut empty = chart.clone();
+        empty.notes.clear();
+        empty.longs.clear();
+        let (_, _, blank) = decode_png(&empty, &options);
+        let layout = chuni_chart_rs::layout::layout(&chart, options.zoom);
+        let scale = render::dimensions(&chart, &options)
+            .unwrap()
+            .pixels_per_second
+            / layout.pps;
+        let bottom = layout
+            .ranges
+            .iter()
+            .map(|(a, b)| (b - a) * layout.pps)
+            .fold(0.0, f64::max)
+            + 82.0;
+        let pixel = |pixels: &[u8], lane: usize, time: f64| -> [u8; 4] {
+            let x = ((68.0 + (lane as f64 + 0.5) * 10.0) * scale).round() as usize;
+            let y = ((bottom - (time - layout.ranges[0].0) * layout.pps) * scale).round() as usize;
+            pixels[(y * width as usize + x) * 4..][..4]
+                .try_into()
+                .unwrap()
+        };
+        // Each grade of a qualifying TAP survives, not just its green ATTACK.
+        for time in [1.175, 1.2, 1.23] {
+            assert_eq!(pixel(&selected, 5, time), pixel(&all, 5, time));
+            assert_ne!(pixel(&selected, 5, time), pixel(&blank, 5, time));
+        }
+        // The CHR before the 0.85s TAP removes its early ATTACK. Filtering that
+        // CHR's bands must not restore the TAP's window. Late-only ATTACK is excluded.
+        for (lane, time) in [(1, 0.81), (1, 0.675), (13, 0.925), (5, 1.27)] {
+            assert_eq!(
+                pixel(&selected, lane, time),
+                pixel(&blank, lane, time),
+                "lane={lane}, time={time}, easy={easy}"
+            );
+        }
+        // Filtering affects bands only: keep even excluded notes, AIR, mines,
+        // and the bodies of HOLD / SLIDE as in the complete judgement chart.
+        for (lane, time) in [
+            (1, 0.75),
+            (1, 0.85),
+            (5, 1.25),
+            (13, 1.0),
+            (13, 1.26),
+            (13, 1.125),
+            (9, 1.75),
+            (13, 2.25),
+        ] {
+            assert_eq!(
+                pixel(&selected, lane, time),
+                pixel(&all, lane, time),
+                "note/body lane={lane}, time={time}"
+            );
+            assert_ne!(
+                pixel(&selected, lane, time),
+                pixel(&blank, lane, time),
+                "missing note/body lane={lane}, time={time}"
+            );
+        }
+        // Ordinary long-note heads still contribute their early judgement bands.
+        for (lane, time) in [(9, 1.48), (13, 1.98)] {
+            assert_ne!(pixel(&selected, lane, time), pixel(&blank, lane, time));
+        }
+    }
+}
+
+#[test]
+fn overlapping_jc_windows_do_not_accumulate_fill_opacity() {
+    let c = Chart::parse("BPM_DEF 600\nCHR 0 192 4 4\nCHR 0 201.6 4 4\nTAP 1 0 12 1").unwrap();
+    for zoom in [0.5, 1.0, 2.0] {
+        let o = Options {
+            judge: true,
+            zoom,
+            ..Default::default()
+        };
+        let layout = chuni_chart_rs::layout::layout(&c, zoom);
+        let d = render::dimensions(&c, &o).unwrap();
+        let scale = d.pixels_per_second / layout.pps;
+        let bottom = layout
+            .ranges
+            .iter()
+            .map(|(a, b)| (b - a) * layout.pps)
+            .fold(0.0, f64::max)
+            + 82.0;
+        // The faster chart leaves an interior sample clear of the soft bevels
+        // and glyphs at every zoom. Overlap is 176.67–233.33 ms.
+        let x = (123.0 * scale).round() as usize;
+        let y = ((bottom - (0.225 - layout.ranges[0].0) * layout.pps) * scale).round() as usize;
+        let (w, _, both) = decode_png(&c, &o);
+        let mut single = c.clone();
+        single.notes.retain(|n| n.time != c.notes[1].time);
+        let (_, _, one) = decode_png(&single, &o);
+        let at = (y * w as usize + x) * 4;
+        assert_eq!(&both[at..at + 4], &one[at..at + 4], "zoom={zoom}");
+        assert_ne!(
+            &both[at..at + 3],
+            &[55, 65, 81],
+            "JC should still have a visible fill"
+        );
+    }
+}
+
+#[test]
 fn thin_attack_is_bright_green_in_final_pixels_without_white_contours() {
     for (zoom, end_measure) in [(0.5, 2), (1.0, 2), (2.0, 2), (1.0, 299)] {
         for height in [1.0, 2.0] {
-            let mut c = Chart::parse(&format!(
-                "BPM_DEF 120\nTAP 0 192 0 4\nTAP 0 220 0 4\nTAP {end_measure} 0 12 1"
-            ))
-            .unwrap();
-            let o = Options {
-                judge: true,
-                zoom,
-                ..Default::default()
-            };
-            let d = render::dimensions(&c, &o).unwrap();
-            c.notes[1].time = 1.0 + 2.0 * (4.0 / 60.0 + height / d.pixels_per_second);
-            let layout = chuni_chart_rs::layout::layout(&c, zoom);
-            let scale = d.pixels_per_second / layout.pps;
-            if end_measure == 299 {
-                assert!(scale < 1.0, "Exercise automatic image downscaling");
-            }
-            let bottom = layout
-                .ranges
-                .iter()
-                .map(|(a, b)| (b - a) * layout.pps)
-                .fold(0.0, f64::max)
-                + 82.0;
-            let boundary_time = (c.notes[0].time + c.notes[1].time) / 2.0;
-            let boundary_y = (bottom - (boundary_time - layout.ranges[0].0) * layout.pps) * scale;
-            let (w, _, pixels) = decode_png(&c, &o);
-            let row = boundary_y.round() as usize;
-            // Include both outer sides: white outlines must not cover the green strip.
-            for x in (68.0 * scale).ceil() as usize..(108.0 * scale).floor() as usize {
-                let p = &pixels[(row * w as usize + x) * 4..][..4];
-                assert!(
-                    p[1] > 200 && p[0] < 100 && p[2] < 180,
-                    "zoom={zoom}, height={height}, pixel ({x},{row})={p:?}"
-                );
+            for early_attack_only in [false, true] {
+                let mut c = Chart::parse(&format!(
+                    "BPM_DEF 120\nTAP 0 192 0 4\nTAP 0 220 0 4\nTAP {end_measure} 0 12 1"
+                ))
+                .unwrap();
+                let o = Options {
+                    judge: true,
+                    early_attack_only,
+                    zoom,
+                    ..Default::default()
+                };
+                let d = render::dimensions(&c, &o).unwrap();
+                c.notes[1].time = 1.0 + 2.0 * (4.0 / 60.0 + height / d.pixels_per_second);
+                let layout = chuni_chart_rs::layout::layout(&c, zoom);
+                let scale = d.pixels_per_second / layout.pps;
+                if end_measure == 299 {
+                    assert!(scale < 1.0, "Exercise automatic image downscaling");
+                }
+                let bottom = layout
+                    .ranges
+                    .iter()
+                    .map(|(a, b)| (b - a) * layout.pps)
+                    .fold(0.0, f64::max)
+                    + 82.0;
+                let boundary_time = (c.notes[0].time + c.notes[1].time) / 2.0;
+                let boundary_y =
+                    (bottom - (boundary_time - layout.ranges[0].0) * layout.pps) * scale;
+                let (w, _, pixels) = decode_png(&c, &o);
+                // Full mode joins two strips at the midpoint. Early-only keeps
+                // one: sample inside it and allow its one-pixel antialiasing.
+                let row = if early_attack_only {
+                    (boundary_y - height / 2.0).floor() as usize
+                } else {
+                    boundary_y.round() as usize
+                };
+                let min_green = if early_attack_only { 130 } else { 200 };
+                // Include both outer sides: relief must not hide the green strip.
+                for x in (68.0 * scale).ceil() as usize..(108.0 * scale).floor() as usize {
+                    let p = &pixels[(row * w as usize + x) * 4..][..4];
+                    assert!(
+                        p[1] > min_green && p[0] < 100 && p[2] < 180,
+                        "zoom={zoom}, height={height}, early_only={early_attack_only}, pixel ({x},{row})={p:?}"
+                    );
+                }
             }
         }
     }
 }
+
 #[test]
 fn direct_images_and_pixel_budget() {
     let c = Chart::parse(SIMPLE).unwrap();
@@ -249,7 +399,7 @@ async fn health_and_fixed_errors() {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
     let d = tempfile::tempdir().unwrap();
-    let router = service::router(d.path().to_owned(), std::time::Duration::from_secs(1));
+    let router = service::router(d.path().to_owned(), std::time::Duration::from_secs(1)).unwrap();
     let response = router
         .clone()
         .oneshot(
