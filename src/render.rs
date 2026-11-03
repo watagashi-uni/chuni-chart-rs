@@ -1114,6 +1114,36 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
                 }
             }
         }
+        // DCM shares SFL's time/duration/value fields but is an independent
+        // game list. Give it a separate right-hand marker, leaving the global
+        // and regional program annotations visible when both occur together.
+        let mut last_dcm_label: Option<f64> = None;
+        for sv in &c.distance_scrolls {
+            if sv.time < end && sv.end_time > start {
+                let yt = y(sv.end_time).max(top);
+                let yb = y(sv.time).min(bottom);
+                let middle = (yt + yb) / 2.0;
+                v.rect(
+                    x + 160.0,
+                    yt,
+                    3.0,
+                    (yb - yt).max(1.0),
+                    scroll_color(sv.velocity),
+                );
+                if last_dcm_label.is_none_or(|last| (last - middle).abs() >= 14.0) {
+                    let label = if sv.velocity != 0.0
+                        && (sv.velocity.abs() < 0.01 || sv.velocity.abs() >= 1000.0)
+                    {
+                        format!("{:.1e}x", sv.velocity)
+                    } else {
+                        format!("{:.2}x", sv.velocity)
+                    };
+                    let color = rgba(209, 213, 219, 255);
+                    v.text(x + 165.0, middle + 4.0, 10.0, &label, color);
+                    last_dcm_label = Some(middle);
+                }
+            }
+        }
         v.clip_x = Some((x, x + 160.0));
         for layer in 2..=5 {
             for (i, n) in c.longs.iter().enumerate() {

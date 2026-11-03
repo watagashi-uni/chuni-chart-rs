@@ -18,6 +18,9 @@ with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
     (root / 'demo.c2s').write_text((Path(__file__).resolve().parents[1] / 'tests/fixtures/demo.c2s').read_text())
     (root / 'styles.c2s').write_text((Path(__file__).resolve().parents[1] / 'tests/fixtures/scroll-slide-styles.c2s').read_text())
+    (root / 'compat.c2s').write_text('BPM_DEF 120\nTAP 0 0 0 4\nTAP 2 0 0 4\n'
+                                  'DCM 0 96 96 0.000001\nDCM 0 192 96 1000\n'
+                                  'STP 1 0 96\nCLK 0 0\nFUTURE arbitrary fields\n')
     (root / 'overflow.c2s').write_text('BPM_DEF 120\nTAP 0 96 -2 4\nSLD 0 0 -16 4 384 28 4')
     (root / 'bad.c2s').write_text('BPM_DEF NaN\nTAP 0 0 0 1')
     (root / 'large.c2s').write_bytes(b' ' * (20 * 1024 * 1024 + 1))
@@ -75,6 +78,12 @@ with tempfile.TemporaryDirectory() as directory:
             subprocess.run([binary, 'render', str(root / 'styles.c2s'), *cli_mode, '-o', str(png)], check=True, stderr=subprocess.DEVNULL)
             status, body = request(path)
             assert status == 200 and body == png.read_bytes(), ('SLP/SLIDE style HTTP/CLI mismatch', path, status)
+        for path, cli_mode in [('/preview?name=compat', []), ('/judge?name=compat', ['--judge']), ('/fastattack/compat', ['--early-attack-only'])]:
+            png = root / 'compat.png'
+            subprocess.run([binary, 'render', str(root / 'compat.c2s'), *cli_mode, '-o', str(png)], check=True, stderr=subprocess.DEVNULL)
+            status, body, headers = request(path, include_headers=True)
+            assert status == 200 and body == png.read_bytes(), ('DCM/unknown-record HTTP/CLI mismatch', path, status)
+            assert request(path, {'If-None-Match': headers['ETag']}) == (304, b'')
         status, _, cache_headers = request('/preview?name=demo', include_headers=True)
         assert status == 200 and cache_headers['ETag']
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:

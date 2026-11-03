@@ -32,10 +32,45 @@ fn malformed_and_expanding_inputs() {
         "BPM_DEF 120\nALD 0 0 0 1 0.00000001 0 384 0 1 0 DEF",
         "BPM_DEF 0.000001\nTAP 2 0 0 1",
         "BPM_DEF 120\nMET_DEF 0 4\nTAP 0 0 0 1",
-        "BPM_DEF 120\nALIEN 0 0 0 1",
     ] {
         assert!(Chart::parse(source).is_err(), "accepted: {source}");
     }
+}
+#[test]
+fn unknown_records_and_clicks_do_not_change_known_chart_data() {
+    let source = format!("{SIMPLE}\nCLK 0 0\nFUTURE arbitrary fields NaN\n");
+    assert_eq!(
+        serde_json::to_value(Chart::parse(&source).unwrap()).unwrap(),
+        serde_json::to_value(Chart::parse(SIMPLE).unwrap()).unwrap()
+    );
+    // Tolerating new record kinds does not swallow malformed known records.
+    assert!(Chart::parse(&format!("{source}TAP invalid\n")).is_err());
+}
+
+#[test]
+fn chart_timing_accepts_large_finite_values_and_bounds_expansion() {
+    let c = Chart::parse(
+        "BPM_DEF 120\nBPM 1 0 123001.547\nBPM 3 0 120\nMET 0 0 384 376\nTAP 4 0 0 1\n",
+    )
+    .unwrap();
+    assert!(c.duration.is_finite() && c.duration < 10.0);
+    assert_eq!(c.measures[0].numerator, 376);
+    assert_eq!(c.beats[1].tick, 1.0);
+    assert!(Chart::parse("BPM_DEF 120\nMET_DEF 1 2147483647\nTAP 1 0 0 1").is_err());
+}
+
+#[test]
+fn dense_charts_fit_the_event_budget_but_unbounded_expansion_does_not() {
+    let rows: String = (0..6500)
+        .map(|i| format!("SLD 0 {} 0 4 1 4 4\n", i * 3))
+        .collect();
+    let dense = Chart::parse(&format!("BPM_DEF 120\n{rows}")).unwrap();
+    assert_eq!(dense.notes.len() + dense.longs.len(), 19_500);
+    let source = format!(
+        "BPM_DEF 120\n{}",
+        "SLD 0 0 0 4 96 4 4\n".repeat(chuni_chart_rs::MAX_EVENTS)
+    );
+    assert!(Chart::parse(&source).is_err());
 }
 #[test]
 fn input_size_boundary_in_parser_and_cli_reader() {

@@ -5,6 +5,55 @@ use chuni_chart_rs::{
 };
 
 #[test]
+fn dcm_is_independent_of_scroll_programs_and_preserves_timing() {
+    let source = "BPM_DEF 120\nBPM 1 0 240\nTAP 0 0 0 4\nTAP 3 0 0 4\nSLP 0 0 384 2 0\n";
+    let base = Chart::parse(source).unwrap();
+    let dcm = Chart::parse(&format!(
+        "{source}DCM 0 192 576 0.000001\nDCM 2 0 384 1000\nDCM 3 0 0 1\n"
+    ))
+    .unwrap();
+    assert_eq!(dcm.distance_scrolls.len(), 3);
+    assert_eq!(dcm.distance_scrolls[0].time, 1.0);
+    assert_eq!(dcm.distance_scrolls[0].end_time, 3.0);
+    assert_eq!(dcm.distance_scrolls[0].velocity, 0.000001);
+    assert_eq!(dcm.distance_scrolls[1].velocity, 1000.0);
+    assert_eq!(dcm.scroll_profile_at(800.0, 0.0, 4.0), 0);
+    assert_eq!(
+        serde_json::to_value(&base.notes).unwrap(),
+        serde_json::to_value(&dcm.notes).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&base.scroll_profiles).unwrap(),
+        serde_json::to_value(&dcm.scroll_profiles).unwrap()
+    );
+    for (judge, early_attack_only) in [(false, false), (true, false), (true, true)] {
+        let opts = Options {
+            judge,
+            early_attack_only,
+            ..Default::default()
+        };
+        let before = render::dimensions(&base, &opts).unwrap();
+        let after = render::dimensions(&dcm, &opts).unwrap();
+        assert_eq!((before.width, before.height), (after.width, after.height));
+        assert_ne!(
+            render::render(&base, &opts).unwrap(),
+            render::render(&dcm, &opts).unwrap()
+        );
+    }
+}
+
+#[test]
+fn legacy_stop_is_zero_speed_and_large_scroll_values_are_annotations() {
+    let stop = Chart::parse("BPM_DEF 120\nTAP 2 0 0 4\nSTP 0 96 384\n").unwrap();
+    let sfl = Chart::parse("BPM_DEF 120\nTAP 2 0 0 4\nSFL 0 96 384 0\n").unwrap();
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::to_value(sfl).unwrap()
+    );
+    assert!(Chart::parse("BPM_DEF 120\nTAP 2 0 0 4\nSFL 0 96 1 200000\n").is_ok());
+}
+
+#[test]
 fn slp_zero_is_the_global_sfl_program_without_an_area() {
     let source = "RESOLUTION 384\nBPM_DEF 120\nBPM 1 0 240\nTAP 0 0 0 4\nTAP 3 0 0 4\nSFL 0 192 576 -2\nSFL 2 0 384 0\n";
     let legacy = Chart::parse(source).unwrap();
@@ -84,6 +133,11 @@ fn invalid_scroll_records_are_rejected_even_without_an_area() {
         "SLA 0 0 0 4 384 1.5",
         "SLA 0 0 0 4 -384 1",
         "SLA 0 0 0 0 384 1",
+        "DCM 0 0 96 NaN",
+        "DCM 0 0 -96 1",
+        "DCM 0 0 200000 1",
+        "DCM 0 0 96",
+        "STP 0 0 -1",
     ] {
         assert!(
             Chart::parse(&format!("BPM_DEF 120\nTAP 1 0 0 4\n{record}\n")).is_err(),

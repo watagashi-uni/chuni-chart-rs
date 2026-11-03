@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-pub use crate::scroll::{Scroll, ScrollArea, ScrollProfile};
+pub use crate::scroll::{Scroll, ScrollArea, ScrollProfile, ScrollSegment};
 use crate::{MAX_EVENTS, MAX_INPUT_BYTES, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -141,6 +141,8 @@ pub struct Chart {
     /// Source speed programs and their note-selection areas, kept independently.
     pub scroll_profiles: Vec<ScrollProfile>,
     pub scroll_areas: Vec<ScrollArea>,
+    /// DCM uses a separate game list, not the SFL/SLP program map.
+    pub distance_scrolls: Vec<ScrollSegment>,
     pub duration: f64,
 }
 pub(crate) fn num(parts: &[&str], i: usize) -> Result<f64> {
@@ -229,7 +231,7 @@ impl Chart {
                 tempo_rows.push((tick(p, resolution)?, num(p, 3)?));
             }
         }
-        if tempo_rows.iter().any(|(_, b)| *b <= 0.0 || *b > 10_000.0) {
+        if tempo_rows.iter().any(|(_, b)| *b <= 0.0) {
             return Err("BPM outside supported range".into());
         }
         tempo_rows.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -264,6 +266,7 @@ impl Chart {
             scrolls: Vec::new(),
             scroll_profiles: Vec::new(),
             scroll_areas: Vec::new(),
+            distance_scrolls: Vec::new(),
             duration: 0.0,
         };
         for (line, p) in lines.iter().enumerate() {
@@ -383,11 +386,10 @@ impl Chart {
                             color,
                         });
                     }
-                    "VERSION" | "MUSIC" | "SEQUENCEID" | "DIFFICULT" | "LEVEL" | "CREATOR"
-                    | "BPM" | "BPM_DEF" | "MET" | "MET_DEF" | "RESOLUTION" | "CLK_DEF"
-                    | "PROGJUDGE_BPM" | "PROGJUDGE_AER" | "TUTORIAL" | "SFL" | "SLP" | "SLA" => {}
-                    k if k.starts_with("T_") => {}
-                    _ => return Err("Unsupported C2S record".into()),
+                    // Metadata, CLK and future record types do not prevent a
+                    // preview of the records we understand. Known numeric
+                    // records are still validated in their respective passes.
+                    _ => {}
                 }
                 if c.notes.len() + c.longs.len() > MAX_EVENTS {
                     return Err("Too many chart events".into());
@@ -483,8 +485,8 @@ impl Chart {
         let meters: Vec<_> = meters.values().copied().collect();
         let mut measure = 0;
         for (i, (t, n, d)) in meters.iter().copied().enumerate() {
-            if !(1.0..=64.0).contains(&n)
-                || !(1.0..=64.0).contains(&d)
+            if !(1.0..=i32::MAX as f64).contains(&n)
+                || !(1.0..=i32::MAX as f64).contains(&d)
                 || n.fract() != 0.0
                 || d.fract() != 0.0
             {

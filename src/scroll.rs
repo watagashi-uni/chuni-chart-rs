@@ -102,7 +102,7 @@ pub(crate) fn parse(c: &mut Chart, lines: &[Vec<&str>]) -> Result<f64> {
     let mut profiles = BTreeMap::<u32, Vec<ScrollSegment>>::new();
     let mut records = 0;
     for p in lines {
-        if !matches!(p[0], "SFL" | "SLP" | "SLA") {
+        if !matches!(p[0], "STP" | "SFL" | "SLP" | "SLA" | "DCM") {
             continue;
         }
         records += 1;
@@ -127,25 +127,35 @@ pub(crate) fn parse(c: &mut Chart, lines: &[Vec<&str>]) -> Result<f64> {
         } else {
             // 0x011A8B60 passes SFL and SLP into the same map insertion:
             // SFL hardcodes id 0; SLP reads it from field 5.
-            let id = if p[0] == "SFL" { 0 } else { profile_id(p, 5)? };
+            let id = if p[0] == "SLP" { profile_id(p, 5)? } else { 0 };
             let end = end_tick(c, start, num(p, 3)?)?;
-            let velocity = num(p, 4)?;
-            if velocity.abs() > 100_000.0 {
-                return Err("Invalid scroll velocity".into());
-            }
-            profiles.entry(id).or_default().push(ScrollSegment {
+            // STP is the legacy zero-speed program. DCM has the same four
+            // numeric fields as SFL but is stored independently by the game.
+            // These values are annotations; their magnitude does not expand
+            // the timeline or allocate pixels. num() rejects NaN/infinity.
+            let velocity = if p[0] == "STP" { 0.0 } else { num(p, 4)? };
+            let segment = ScrollSegment {
                 tick: start,
                 end_tick: end,
                 time: c.seconds_at(start),
                 end_time: c.seconds_at(end),
                 velocity,
-            });
+            };
+            if p[0] == "DCM" {
+                c.distance_scrolls.push(segment);
+            } else {
+                profiles.entry(id).or_default().push(segment);
+            }
         }
     }
     for segments in profiles.values_mut() {
         segments.sort_by(|a, b| a.tick.total_cmp(&b.tick));
     }
     let mut global_end: f64 = 0.0;
+    c.distance_scrolls.sort_by(|a, b| a.tick.total_cmp(&b.tick));
+    for s in &c.distance_scrolls {
+        global_end = global_end.max(s.end_tick);
+    }
     if let Some(global) = profiles.get(&0) {
         for s in global {
             global_end = global_end.max(s.end_tick);
