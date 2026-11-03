@@ -226,7 +226,7 @@ fn early_attack_mode_filters_after_protection_and_draws_only_early_bands() {
             .iter()
             .map(|(a, b)| (b - a) * layout.pps)
             .fold(0.0, f64::max)
-            + 82.0;
+            + 44.0;
         let pixel = |pixels: &[u8], lane: usize, time: f64| -> [u8; 4] {
             let x = ((68.0 + (lane as f64 + 0.5) * 10.0) * scale).round() as usize;
             let y = ((bottom - (time - layout.ranges[0].0) * layout.pps) * scale).round() as usize;
@@ -295,7 +295,7 @@ fn overlapping_jc_windows_do_not_accumulate_fill_opacity() {
             .iter()
             .map(|(a, b)| (b - a) * layout.pps)
             .fold(0.0, f64::max)
-            + 82.0;
+            + 44.0;
         // The faster chart leaves an interior sample clear of the soft bevels
         // and glyphs at every zoom. Overlap is 176.67–233.33 ms.
         let x = (123.0 * scale).round() as usize;
@@ -341,7 +341,7 @@ fn thin_attack_is_bright_green_in_final_pixels_without_white_contours() {
                     .iter()
                     .map(|(a, b)| (b - a) * layout.pps)
                     .fold(0.0, f64::max)
-                    + 82.0;
+                    + 44.0;
                 let boundary_time = (c.notes[0].time + c.notes[1].time) / 2.0;
                 let boundary_y =
                     (bottom - (boundary_time - layout.ranges[0].0) * layout.pps) * scale;
@@ -398,7 +398,7 @@ fn wide_charts_keep_native_text_size_until_the_image_budget_is_reached() {
     let d = render::dimensions(&c, &o).unwrap();
     assert_eq!(d.columns, 41);
     assert_eq!(d.width, 10216);
-    assert_eq!(d.height, 3068);
+    assert_eq!(d.height, 3016);
     assert_eq!(d.pixels_per_second, 350.0);
     // Very wide charts still have bounded allocations and JPEG-safe dimensions.
     let c = Chart::parse("BPM_DEF 1000\nTAP 0 0 0 4\nTAP 1999 383 0 4").unwrap();

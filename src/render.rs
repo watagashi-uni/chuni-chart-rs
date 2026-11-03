@@ -49,7 +49,7 @@ pub struct Dimensions {
 const MAX_PIXELS: f64 = 40_000_000.0;
 const MAX_SIDE: f64 = 32768.0;
 const STRIDE: f64 = 248.0;
-const FOOT: f64 = 42.0;
+const FOOT: f64 = 28.0;
 type Color = [u8; 4];
 fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
     [r, g, b, a]
@@ -86,8 +86,7 @@ fn sheet(c: &Chart, o: &Options) -> Result<(crate::layout::Layout, f64, f64)> {
         .map(|(a, b)| (b - a) * layout.pps)
         .fold(0.0, f64::max)
         + 88.0
-        + FOOT
-        + if o.shows_judgements() { 38.0 } else { 0.0 };
+        + FOOT;
     Ok((layout, w, h))
 }
 pub fn dimensions(c: &Chart, o: &Options) -> Result<Dimensions> {
@@ -966,36 +965,6 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
         clip_x: None,
     };
     v.pix.fill(tiny_skia::Color::from_rgba8(107, 114, 128, 255));
-    if o.shows_judgements() {
-        v.rect(0.0, 0.0, w, 60.0, rgba(32, 43, 60, 255));
-        for (i, (label, g)) in [
-            ("JUSTICE CRITICAL", "JC"),
-            ("JUSTICE", "JUSTICE"),
-            ("ATTACK", "ATTACK"),
-            ("FLICK TOUCH", "TOUCH"),
-        ]
-        .iter()
-        .take(if o.early_attack_only { 3 } else { 4 })
-        .enumerate()
-        {
-            let x = 20.0 + [0.0, 202.0, 330.0, 450.0][i];
-            let mut color = grade(g);
-            color[3] = 255;
-            v.rect(x, 14.0, 10.0, 10.0, color);
-            v.text(x + 17.0, 25.0, 15.0, label, rgba(238, 242, 252, 255));
-        }
-        v.text(
-            20.0,
-            48.0,
-            11.0,
-            if o.early_attack_only {
-                "Early ATTACK bands only: pre-note ATTACK / JUSTICE / JC. All notes shown."
-            } else {
-                "JC: shared fill + soft relief per note. Overlap does not imply input ownership."
-            },
-            rgba(196, 211, 230, 255),
-        );
-    }
     let windows = if o.shows_judgements() {
         protect_with_resolution(&notes, o.easy, c.resolution)
     } else {
@@ -1125,16 +1094,9 @@ pub fn render(c: &Chart, o: &Options) -> Result<Vec<u8>> {
     v.rect(0.0, h - FOOT, w, FOOT, rgba(32, 43, 60, 255));
     v.text(
         12.0,
-        h - 23.0,
+        h - 9.0,
         12.0,
-        "github.com/watagashi-uni/chuni-chart-rs (AGPL-3.0)",
-        rgba(212, 225, 238, 255),
-    );
-    v.text(
-        12.0,
-        h - 7.0,
-        11.0,
-        "Original: QingQiz/MarisaBot",
+        "github.com/watagashi-uni/chuni-chart-rs | Origin: github.com/QingQiz/MarisaBot",
         rgba(212, 225, 238, 255),
     );
     let mut out = Bounded(Vec::new());

@@ -115,7 +115,7 @@ with tempfile.TemporaryDirectory() as directory:
             assert limit_png == png, 'Input padding changed rendered chart'
             assert request(f'/api/render/{name}', {'If-None-Match': limit_tag})[0] == 304
         _, wide_png = image(request('/judge?name=wide'))
-        assert struct.unpack('>II', wide_png[16:24]) == (10216, 3068)
+        assert struct.unpack('>II', wide_png[16:24]) == (10216, 3016)
         _, budget_png = image(request('/judge?name=budget'))
         width, height = struct.unpack('>II', budget_png[16:24])
         assert 39_900_000 < width * height <= 40_000_000 and max(width, height) <= 32768
